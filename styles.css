@@ -1,0 +1,310 @@
+.ink-view-content {
+  padding: 0 !important;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  position: relative;
+  background: #ffffff;
+}
+
+/* Einheitliche Desktop-Toolbar auf PC & Tablet/Mobile */
+.ink-toolbar,
+.is-mobile .ink-toolbar,
+.is-tablet .ink-toolbar,
+.is-phone .ink-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  min-height: 44px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  z-index: 20;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.ink-toolbar.is-collapsed {
+  display: none !important;
+}
+
+/* Neutralisiert Obsidians .is-mobile Button-Overrides für 1:1 PC-Look */
+.ink-view-content .ink-btn,
+.is-mobile .ink-view-content .ink-btn {
+  all: unset;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  width: 32px !important;
+  height: 32px !important;
+  min-width: 32px !important;
+  min-height: 32px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px !important;
+  background: transparent !important;
+  color: var(--text-normal) !important;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease, transform 0.08s ease;
+}
+
+.ink-view-content .ink-btn svg {
+  width: 17px;
+  height: 17px;
+  stroke-width: 2px;
+}
+
+.ink-view-content .ink-btn:hover:not(:disabled) {
+  background: var(--background-modifier-hover) !important;
+}
+
+.ink-view-content .ink-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.ink-view-content .ink-btn:disabled {
+  opacity: 0.32 !important;
+  pointer-events: none;
+}
+
+.ink-view-content .ink-btn.is-active {
+  background: var(--interactive-accent) !important;
+  color: var(--text-on-accent) !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+.ink-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 20px;
+  margin: 0 4px;
+  background: var(--background-modifier-border);
+}
+
+.ink-colors {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 2px;
+}
+
+/* Exakt runde Farbpunkte auf PC & Tablet */
+.ink-view-content .ink-swatch,
+.is-mobile .ink-view-content .ink-swatch {
+  all: unset;
+  box-sizing: border-box;
+  flex-shrink: 0;
+  width: 22px !important;
+  height: 22px !important;
+  min-width: 22px !important;
+  min-height: 22px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 50% !important;
+  border: 2px solid var(--background-modifier-border) !important;
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  position: relative;
+}
+
+.ink-view-content .ink-swatch:hover {
+  transform: scale(1.1);
+}
+
+.ink-view-content .ink-swatch.is-active {
+  outline: 2px solid var(--interactive-accent) !important;
+  outline-offset: 2px !important;
+  transform: scale(1.08);
+}
+
+/* Custom-Color-Picker Button (Regenbogen-Kreis) */
+.ink-color-picker-wrap {
+  position: relative;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ink-color-picker-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--background-modifier-border);
+  background: conic-gradient(
+    #ff3b30, #ff9500, #ffcc00, #34c759, #00c7be, #007aff, #5856d6, #af52de, #ff2d55, #ff3b30
+  );
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+  pointer-events: none;
+}
+
+.ink-color-input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+  border: none;
+}
+
+.ink-slider-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.ink-ico {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.ink-ico svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* Einheitlicher kompakter Slider auf PC & Mobile */
+.ink-view-content .ink-width,
+.is-mobile .ink-view-content .ink-width {
+  -webkit-appearance: none;
+  appearance: none;
+  flex-shrink: 0;
+  width: 72px !important;
+  height: 5px !important;
+  min-height: 5px !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border-radius: 999px;
+  background: var(--background-modifier-border);
+  outline: none;
+}
+
+.ink-view-content .ink-width::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  border: 2px solid var(--background-primary);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+
+.ink-val-label {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-width: 22px;
+  text-align: right;
+}
+
+.ink-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: #ffffff;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.ink-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* Schwebende HUD-Elemente (Zoom-Badge, Diagnose-Banner & Toolbar-Toggle) */
+.ink-hud-zoom,
+.is-mobile .ink-hud-zoom {
+  all: unset;
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  z-index: 15;
+  user-select: none;
+}
+
+.ink-hud-debug {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  padding: 5px 10px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-family: var(--font-monospace);
+  color: #ffffff;
+  background: rgba(20, 24, 33, 0.85);
+  pointer-events: none;
+  z-index: 15;
+  display: none;
+}
+
+.ink-hud-debug.is-visible {
+  display: block;
+}
+
+.ink-hud-uncollapse,
+.is-mobile .ink-hud-uncollapse {
+  all: unset;
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  cursor: pointer;
+  z-index: 25;
+}
+
+.ink-hud-uncollapse.is-visible {
+  display: inline-flex;
+}

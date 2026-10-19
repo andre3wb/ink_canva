@@ -1,0 +1,17 @@
+{
+  "fingerDraws": true,
+  "penButton": "eraser",
+  "penEraserEnd": true,
+  "penButtonDebug": true,
+  "smoothing": 0.4,
+  "shapeRecognition": true,
+  "shapeHoldMs": 600,
+  "twoFingerUndo": true,
+  "pdfQuality": 2,
+  "background": "grid",
+  "penWidth": 8,
+  "customPenColors": [
+    "#b56bff"
+  ],
+  "customHlColors": []
+}
