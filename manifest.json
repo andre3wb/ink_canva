@@ -1,7 +1,7 @@
 {
   "id": "ink-canvas",
   "name": "Ink Canvas (S Pen)",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "minAppVersion": "1.5.0",
   "description": "Handschrift-Notizen mit S Pen auf einer unendlichen Leinwand – inklusive Custom-Farben, PDF-Ausdruck & PDF-Anhang-Verknüpfung.",
   "author": "Andreas Blumenschein",
