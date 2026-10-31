@@ -1,12 +1,19 @@
 "use strict";
 /*
- * Ink Canvas v1.3.0 – Handschrift-Notizen mit S Pen für Obsidian
- * Neu in v1.3.0:
- * - Freie Farbauswahl (Custom Color Picker) für Stift & Textmarker inkl. Speicherung
- * - PDF-Dateien wahlweise als "Ausdruck" (Seiten) ODER als kompakte "Anhang-Karte" (Link) einfügen
- * - Tiefgreifender S-Pen-Barrel-Button-Fix für Android/Samsung One UI:
- *   Fängt PointerEvents, native Android TouchEvents (toolType === "eraser"),
- *   S-Pen Contextmenu-Signale und Bluetooth/Key-Events ab.
+ * Ink Canvas v2.1.1 – Handschrift-Notizen mit S Pen für Obsidian
+ * Neu in v2.1.1 (Bugfix Release):
+ * - S-Pen-Seitentaste Bugfix (Kein Einfrieren beim Aufsetzen auf das Display):
+ *   1) Verhindert Androids `pointercancel` / `StylusTextSelector`-Unterbrechung beim Aufsetzen
+ *      mit gehaltener Seitentaste durch aktive `touchstart`/`touchmove`-Behandlung (`passive: false`).
+ *   2) Führt das Radieren (bzw. Verschieben) nahtlos über `pointermove`, `pointerrawupdate` UND
+ *      `touchmove`-Fallback fort, sodass der Radierer beim Aufsetzen niemals einfriert.
+ *   3) Entfernt die fehlerhafte `isPenTouchingDisplay`-Blockade und das 500ms-Timeout bei `pointercancel`.
+ *   4) Schaltet beim Loslassen der Seitentaste sofort wieder auf den vorher benutzten Stift zurück.
+ *
+ * Neu in v2.1.0:
+ * 1. Nachträgliches Ändern bereits eingebetteter PDF-Dateien (für alle Einbettungsarten:
+ *    PDF-Viewer-Fenster, PDF-Seiten-Ausdruck & PDF-Anhang-Karte) inkl. Undo/Redo.
+ * 2. S-Pen-Seitentaste (Halten = Radierer, Loslassen = vorheriger Stift).
  */
 const obsidian = require("obsidian");
 const {
@@ -20,10 +27,13 @@ const PAGE_W = 800;
 const PAGE_GAP = 24;
 const CARD_W = 320;
 const CARD_H = 76;
+const VIEWER_W = 520;
+const VIEWER_H = 680;
 const HL_MULT = 4;
 const ERASER_R = 16;
 const HANDLE_R = 24;
-const MAX_CACHED_PAGES = 12;
+const MAX_CACHED_PAGES = 14;
+const MAX_CUSTOM_COLORS = 5;
 const DEFAULT_PEN_COLORS = ["#111111", "#e03131", "#1971c2", "#2f9e44", "#f08c00", "#7048e8"];
 const DEFAULT_HL_COLORS = ["#ffe14d", "#ff8fb1", "#7de08a", "#6cc8ff"];
 const BGS = ["grid", "lines", "dots", "none"];
@@ -32,7 +42,6 @@ const BG_LABELS = { grid: "Karo", lines: "Linien", dots: "Punkte", none: "Blanko
 const DEFAULT_SETTINGS = {
   fingerDraws: false,
   penButton: "eraser",      // "eraser" | "pan" | "off"
-  penEraserEnd: true,
   penButtonDebug: false,
   smoothing: 0.35,
   shapeRecognition: true,
@@ -56,7 +65,8 @@ const newDoc = (bg) => ({
   view: { x: 40, y: 40, z: 1 },
   strokes: [],
   pdfs: [],
-  links: [], // Neu in v1.3: Verknüpfte PDF-Anhänge als Karten
+  links: [],
+  viewers: [],
 });
 const widthMult = (s) => (s.tool === "highlighter" ? HL_MULT : 1);
 
@@ -303,14 +313,13 @@ function paintStroke(ctx, s, predictedPts) {
   }
 }
 
-/* ----- PDF-Anhang-Karte zeichnen (Neu in v1.3) ----- */
+/* ----- PDF-Anhang-Karte zeichnen (inkl. "⇄" Datei-Ändern-Button & "Öffnen ↗") ----- */
 function drawPdfLinkCard(ctx, lnk, z) {
   const x = lnk.x, y = lnk.y, w = lnk.w || CARD_W;
   const s = w / CARD_W;
   const h = CARD_H * s;
 
   ctx.save();
-  // Kartenschatten & Hintergrund
   ctx.shadowColor = "rgba(15, 23, 42, 0.10)";
   ctx.shadowBlur = 10 * s;
   ctx.shadowOffsetY = 3 * s;
@@ -323,7 +332,6 @@ function drawPdfLinkCard(ctx, lnk, z) {
   ctx.strokeStyle = "#cbd5e1";
   ctx.stroke();
 
-  // Rotes PDF-Badge links
   const bx = x + 12 * s, by = y + 12 * s, bw = 52 * s, bh = 52 * s;
   roundRectPath(ctx, bx, by, bw, bh, 10 * s);
   ctx.fillStyle = "#e03131";
@@ -335,10 +343,9 @@ function drawPdfLinkCard(ctx, lnk, z) {
   ctx.textBaseline = "middle";
   ctx.fillText("PDF", bx + bw / 2, by + bh / 2);
 
-  // Dateiname & Untertitel
   const name = (lnk.path.split("/").pop() || lnk.path);
   const tx = bx + bw + 12 * s;
-  const maxTextW = w - (tx - x) - 74 * s;
+  const maxTextW = w - (tx - x) - 108 * s;
 
   ctx.textAlign = "left";
   ctx.fillStyle = "#0f172a";
@@ -353,9 +360,21 @@ function drawPdfLinkCard(ctx, lnk, z) {
   ctx.font = `${Math.round(11 * s)}px sans-serif`;
   ctx.fillText("Verknüpfter Anhang", tx, y + 49 * s);
 
-  // "Öffnen"-Button rechts auf der Karte
+  // "⇄" Button zum direkten Ändern der PDF-Datei auf der Karte
+  const chgW = 30 * s, chgH = 30 * s;
   const btnW = 58 * s, btnH = 30 * s;
-  const btnX = x + w - btnW - 12 * s, btnY = y + (h - btnH) / 2;
+  const btnX = x + w - btnW - 10 * s, btnY = y + (h - btnH) / 2;
+  const chgX = btnX - chgW - 6 * s, chgY = btnY;
+
+  roundRectPath(ctx, chgX, chgY, chgW, chgH, 7 * s);
+  ctx.fillStyle = "#e2e8f0";
+  ctx.fill();
+  ctx.fillStyle = "#1e293b";
+  ctx.font = `700 ${Math.round(13 * s)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.fillText("⇄", chgX + chgW / 2, chgY + chgH / 2);
+
+  // "Öffnen ↗" Button
   roundRectPath(ctx, btnX, btnY, btnW, btnH, 7 * s);
   ctx.fillStyle = "#e2e8f0";
   ctx.fill();
@@ -367,18 +386,22 @@ function drawPdfLinkCard(ctx, lnk, z) {
   ctx.restore();
 }
 
-/* ---------- PDF-Auswahl ---------- */
+/* ---------- Reines Vault-PDF-Auswahlfenster ---------- */
 class PdfSuggestModal extends FuzzySuggestModal {
-  constructor(app, onChoose) {
+  constructor(app, onChoose, placeholder) {
     super(app);
     this.onChoose = onChoose;
-    this.setPlaceholder("PDF aus dem Vault auswählen …");
+    this.setPlaceholder(placeholder || "PDF aus dem Vault suchen und auswählen …");
   }
   getItems() {
     return this.app.vault.getFiles().filter((f) => f.extension.toLowerCase() === "pdf");
   }
-  getItemText(f) { return f.path; }
-  onChooseItem(f) { this.onChoose(f); }
+  getItemText(item) {
+    return item.path;
+  }
+  onChooseItem(item) {
+    this.onChoose(item);
+  }
 }
 
 /* ---------- Die Ansicht ---------- */
@@ -405,7 +428,7 @@ class InkView extends TextFileView {
     this.active = null;
     this.cur = null;
     this.predicted = [];
-    this.sel = null;              // { entry: PDF|null, link: LinkCard|null, strokes: [...] }
+    this.sel = null;
     this.lasso = null;
     this.scaling = false;
     this.snapped = null;
@@ -415,14 +438,23 @@ class InkView extends TextFileView {
     this.holdAnchor = null;
     this.eraserPos = null;
 
-    // S-Pen Multi-Layer Seitentasten-Tracking (Pointer + Android Touch + Contextmenu + Key)
+    // S-Pen Seitentasten-Zustandsautomat (v2.1.1: Halten = Radierer ohne Einfrieren, Loslassen = vorheriger Stift)
     this.lastPen = 0;
-    this.lastBarrelTime = 0;
+    this.lastPenDownTime = 0;
+    this.barrelHeld = false;
+    this.lastBarrelSignalTime = 0;
+    this.hoverClearFrames = 0;
+    this.hoverBtn1Frames = 0;
+    this.contactHasBarrelBit = false;
+    this.contextMenuBarrel = false;
     this.androidTouchEraser = false;
+    this.touchContactActive = false;
     this.keyBarrelHeld = false;
-    this.hoverZeroFrames = 0;
     this.lastTapTime = 0;
     this.lastTapPos = null;
+
+    // Eingebettete PDF-Viewer DOM-Instanzen
+    this.viewerDom = new Map();
 
     // Rendering & Offscreen-Cache
     this.cssW = 0; this.cssH = 0; this.dpr = 1;
@@ -448,6 +480,8 @@ class InkView extends TextFileView {
     if (this.ro) this.ro.disconnect();
     if (this._keyDownHandler) window.removeEventListener("keydown", this._keyDownHandler, true);
     if (this._keyUpHandler) window.removeEventListener("keyup", this._keyUpHandler, true);
+    if (this._outsideClickHandler) window.removeEventListener("pointerdown", this._outsideClickHandler, true);
+    this.destroyViewerDoms();
     this.destroyPdfs();
   }
 
@@ -455,6 +489,7 @@ class InkView extends TextFileView {
   getViewData() { return this.serialize(); }
   setViewData(data) { this.loadData(data); }
   clear() {
+    this.destroyViewerDoms();
     this.destroyPdfs();
     this.doc = newDoc(this.plugin.settings.background);
     this.undoStack = []; this.redoStack = [];
@@ -487,6 +522,17 @@ class InkView extends TextFileView {
         id: l.id, path: l.path, x: r1(l.x), y: r1(l.y), w: r1(l.w || CARD_W),
       }));
     }
+    if (d.viewers && d.viewers.length) {
+      out.viewers = d.viewers.map((vw) => ({
+        id: vw.id,
+        path: vw.path,
+        x: r1(vw.x),
+        y: r1(vw.y),
+        w: r1(vw.w || VIEWER_W),
+        h: r1(vw.h || VIEWER_H),
+        page: vw.page || 0,
+      }));
+    }
     return JSON.stringify(out);
   }
 
@@ -512,13 +558,27 @@ class InkView extends TextFileView {
       d.links = (j.links || []).map((l) => ({
         id: l.id || uid(), path: l.path, x: l.x || 0, y: l.y || 0, w: l.w || CARD_W,
       }));
+      d.viewers = (j.viewers || []).map((vw) => ({
+        id: vw.id || uid(),
+        path: vw.path,
+        x: vw.x || 0,
+        y: vw.y || 0,
+        w: vw.w || VIEWER_W,
+        h: vw.h || VIEWER_H,
+        page: Number.isInteger(vw.page) ? vw.page : 0,
+      }));
     }
+    this.destroyViewerDoms();
     this.destroyPdfs();
     this.doc = d;
     this.undoStack = []; this.redoStack = [];
     this.sel = null;
     this.refreshToolbar();
     for (const entry of d.pdfs) this.ensureDoc(entry.path).catch(() => {});
+    for (const vw of d.viewers) {
+      this.ensureDoc(vw.path).then(() => this.syncViewerDoms()).catch(() => {});
+    }
+    this.syncViewerDoms();
     this.invalidateStatic();
   }
 
@@ -532,7 +592,15 @@ class InkView extends TextFileView {
     this.pending.clear();
   }
 
-  /* ----- PDF (Ausdruck & Anhang-Karte) ----- */
+  destroyViewerDoms() {
+    for (const item of this.viewerDom.values()) {
+      try { if (item.io) item.io.disconnect(); } catch (e) { /* */ }
+      try { item.el.remove(); } catch (e) { /* */ }
+    }
+    this.viewerDom.clear();
+  }
+
+  /* ----- PDF (Ausdruck, Anhang-Karte, Eingebetteter Viewer & Dateiaustausch v2.1.0) ----- */
   ensureDoc(path) {
     const existing = this.docs.get(path);
     if (existing) return existing.promise;
@@ -562,6 +630,7 @@ class InkView extends TextFileView {
         d.error = String(e && e.message ? e.message : e);
         throw e;
       } finally {
+        this.syncViewerDoms();
         this.invalidateStatic();
       }
       return d;
@@ -573,12 +642,13 @@ class InkView extends TextFileView {
   entryLayout(e) {
     const d = this.docs.get(e.path);
     if (!d || d.state !== "ok") return null;
-    if (e._lay && e._lw === e.w && e._ld === d) return e._lay;
+    if (e._lay && e._lw === e.w && e._ld === d && e._lp === e.page) return e._lay;
     const pages = [];
     let y = 0;
     if (e.page != null) {
-      const h = e.w * (d.asp[e.page] || 1.414);
-      pages.push({ idx: e.page, y: 0, h });
+      const safeIdx = clamp(e.page, 0, Math.max(0, d.asp.length - 1));
+      const h = e.w * (d.asp[safeIdx] || 1.414);
+      pages.push({ idx: safeIdx, y: 0, h });
       y = h;
     } else {
       const gap = (PAGE_GAP * e.w) / PAGE_W;
@@ -592,6 +662,7 @@ class InkView extends TextFileView {
     e._lay = { pages, total: y };
     e._lw = e.w;
     e._ld = d;
+    e._lp = e.page;
     return e._lay;
   }
 
@@ -647,7 +718,6 @@ class InkView extends TextFileView {
     return fallback;
   }
 
-  /** Fügt ein PDF als Seiten-Ausdruck ein. */
   async addPdf(file) {
     const d = this.doc;
     let x = 0;
@@ -668,22 +738,477 @@ class InkView extends TextFileView {
     this.changed();
   }
 
-  /** Neu in v1.3: Fügt ein PDF als kompakte, anklickbare Anhang-Karte ein. */
   addPdfLink(file) {
     const d = this.doc;
     const v = d.view;
-    // Karte mittig im aktuellen Sichtfeld platzieren
     const cx = (this.cssW / 2 - v.x) / v.z - CARD_W / 2;
     const cy = (this.cssH / 2 - v.y) / v.z - CARD_H / 2;
     const link = { id: uid(), path: file.path, x: Math.round(cx), y: Math.round(cy), w: CARD_W };
     d.links.push(link);
     this.pushUndo({ t: "linkadd", link });
-    this.sel = { entry: null, link, strokes: [] };
+    this.sel = { entry: null, link, viewer: null, strokes: [] };
     new Notice(`PDF-Anhang verknüpft: ${file.name}`);
     this.changed();
   }
 
-  /** Öffnet ein verknüpftes PDF in einem neuen Obsidian-Tab. */
+  async addPdfViewer(file) {
+    const d = this.doc;
+    const v = d.view;
+    const cx = (this.cssW / 2 - v.x) / v.z - VIEWER_W / 2;
+    const cy = (this.cssH / 2 - v.y) / v.z - VIEWER_H / 2;
+    const viewer = {
+      id: uid(),
+      path: file.path,
+      x: Math.round(cx),
+      y: Math.round(cy),
+      w: VIEWER_W,
+      h: VIEWER_H,
+      page: 0,
+    };
+    try {
+      await this.ensureDoc(file.path);
+    } catch (e) {
+      this.docs.delete(file.path);
+      new Notice("PDF konnte nicht geladen werden: " + file.name);
+      return;
+    }
+    d.viewers.push(viewer);
+    this.pushUndo({ t: "vieweradd", viewer });
+    this.sel = { entry: null, link: null, viewer, strokes: [] };
+    this.syncViewerDoms();
+    new Notice(`PDF-Viewer eingebettet: ${file.name}`);
+    this.changed();
+  }
+
+  /**
+   * v2.1.0: Nachträgliches Ändern der PDF-Datei eines bereits eingebetteten PDF-Elements
+   * (unterstützt "entry" = Seiten-Ausdruck, "link" = Anhang-Karte, "viewer" = PDF-Viewer-Fenster).
+   */
+  changePdfFile(target, targetType) {
+    if (!target || !targetType) return;
+    const currentName = target.path ? (target.path.split("/").pop() || target.path) : "PDF";
+    new PdfSuggestModal(
+      this.app,
+      async (newFile) => {
+        if (!newFile) return;
+        if (newFile.path === target.path) {
+          new Notice(`„${newFile.name}“ ist bereits für dieses Element ausgewählt.`);
+          return;
+        }
+        const oldPath = target.path;
+        const oldPage = target.page;
+
+        if (targetType === "entry" || targetType === "viewer") {
+          try {
+            await this.ensureDoc(newFile.path);
+          } catch (e) {
+            this.docs.delete(newFile.path);
+            new Notice("Neue PDF konnte nicht geladen werden: " + newFile.name);
+            return;
+          }
+        }
+
+        target.path = newFile.path;
+
+        if (targetType === "entry") {
+          const d = this.docs.get(newFile.path);
+          if (target.page != null && d && d.asp && d.asp.length) {
+            target.page = clamp(target.page, 0, d.asp.length - 1);
+          }
+          target._lay = null;
+          target._lw = null;
+          target._ld = null;
+          target._lp = null;
+        } else if (targetType === "viewer") {
+          target.page = 0;
+          this.refreshViewerDom(target);
+        }
+
+        this.pushUndo({
+          t: "pdfchange",
+          targetType,
+          target,
+          oldPath,
+          newPath: newFile.path,
+          oldPage,
+          newPage: target.page,
+        });
+        new Notice(`PDF geändert: ${currentName} → ${newFile.name}`);
+        this.changed();
+      },
+      `Ersatz-PDF für „${currentName}“ auswählen …`
+    ).open();
+  }
+
+  changeSelectedPdf() {
+    const s = this.sel;
+    if (s) {
+      if (s.entry) return this.changePdfFile(s.entry, "entry");
+      if (s.link) return this.changePdfFile(s.link, "link");
+      if (s.viewer) return this.changePdfFile(s.viewer, "viewer");
+    }
+    this.promptChangeAnyEmbeddedPdf();
+  }
+
+  getAllEmbeddedPdfs() {
+    const list = [];
+    for (const vw of (this.doc.viewers || [])) {
+      const name = vw.path.split("/").pop() || vw.path;
+      list.push({ type: "viewer", obj: vw, label: `Viewer-Fenster: ${name}`, icon: "layout-panel-left" });
+    }
+    for (const p of (this.doc.pdfs || [])) {
+      const name = p.path.split("/").pop() || p.path;
+      const suffix = p.page != null ? ` (Seite ${p.page + 1})` : " (Ausdruck)";
+      list.push({ type: "entry", obj: p, label: `Seiten-Ausdruck: ${name}${suffix}`, icon: "file-text" });
+    }
+    for (const l of (this.doc.links || [])) {
+      const name = l.path.split("/").pop() || l.path;
+      list.push({ type: "link", obj: l, label: `Anhang-Karte: ${name}`, icon: "paperclip" });
+    }
+    return list;
+  }
+
+  promptChangeAnyEmbeddedPdf(ev) {
+    const all = this.getAllEmbeddedPdfs();
+    if (!all.length) {
+      new Notice("Keine eingebetteten PDF-Dateien in dieser Notiz vorhanden.");
+      return;
+    }
+    if (all.length === 1) {
+      this.changePdfFile(all[0].obj, all[0].type);
+      return;
+    }
+    const menu = new Menu();
+    for (const item of all) {
+      menu.addItem((mi) =>
+        mi
+          .setTitle(item.label)
+          .setIcon(item.icon)
+          .onClick(() => {
+            if (item.type === "entry") {
+              this.sel = { entry: item.obj, link: null, viewer: null, strokes: this.strokesInEntry(item.obj) };
+            } else if (item.type === "link") {
+              this.sel = { entry: null, link: item.obj, viewer: null, strokes: [] };
+            } else if (item.type === "viewer") {
+              this.sel = { entry: null, link: null, viewer: item.obj, strokes: [] };
+            }
+            this.refreshToolbar();
+            this.updateViewersTransform();
+            this.requestDraw();
+            this.changePdfFile(item.obj, item.type);
+          })
+      );
+    }
+    if (ev && typeof ev.clientX === "number") {
+      menu.showAtMouseEvent(ev);
+    } else {
+      menu.showAtPosition({ x: Math.round(this.cssW / 2), y: 60 });
+    }
+  }
+
+  refreshViewerDom(vw) {
+    const item = this.viewerDom.get(vw.id);
+    if (!item) {
+      this.syncViewerDoms();
+      return;
+    }
+    const fileName = vw.path.split("/").pop() || vw.path;
+    if (item.titleEl) {
+      item.titleEl.textContent = fileName;
+      item.titleEl.setAttribute("title", vw.path);
+    }
+    try { if (item.io) item.io.disconnect(); } catch (e) { /* */ }
+    item.io = null;
+    item.builtPages = false;
+    item.bodyEl.empty();
+    item.pageEls = [];
+    item.pageLabelEl.textContent = `${(vw.page || 0) + 1} / ?`;
+    const d = this.docs.get(vw.path);
+    if (d && d.state === "ok") {
+      this.populateViewerPages(vw, item, d);
+    } else {
+      this.ensureDoc(vw.path).then(() => this.syncViewerDoms()).catch(() => {});
+    }
+    this.updateViewersTransform();
+  }
+
+  insertViewerPageToCanvas(vw) {
+    const pageIdx = clamp(vw.page || 0, 0, 9999);
+    const entry = {
+      id: uid(),
+      path: vw.path,
+      x: Math.round(vw.x + (vw.w || VIEWER_W) + 40),
+      y: Math.round(vw.y),
+      w: PAGE_W,
+      page: pageIdx,
+    };
+    this.doc.pdfs.push(entry);
+    this.pushUndo({ t: "pdfadd", entry });
+    this.sel = { entry, link: null, viewer: null, strokes: [] };
+    new Notice(`Seite ${pageIdx + 1} auf die Leinwand übernommen.`);
+    this.changed();
+  }
+
+  syncViewerDoms() {
+    if (!this.viewersLayer) return;
+    const viewers = this.doc.viewers || [];
+    const activeIds = new Set(viewers.map((v) => v.id));
+
+    for (const [id, item] of this.viewerDom.entries()) {
+      if (!activeIds.has(id)) {
+        try { if (item.io) item.io.disconnect(); } catch (e) { /* */ }
+        item.el.remove();
+        this.viewerDom.delete(id);
+      }
+    }
+
+    for (const vw of viewers) {
+      let item = this.viewerDom.get(vw.id);
+      if (!item) {
+        item = this.createViewerDom(vw);
+        this.viewerDom.set(vw.id, item);
+      }
+      const d = this.docs.get(vw.path);
+      if (d && d.state === "ok" && !item.builtPages) {
+        this.populateViewerPages(vw, item, d);
+      }
+    }
+    this.updateViewersTransform();
+  }
+
+  createViewerDom(vw) {
+    const el = this.viewersLayer.createDiv({ cls: "ink-pdf-viewer" });
+    const header = el.createDiv({ cls: "ink-pdf-viewer-header" });
+    header.createSpan({ cls: "ink-pdf-viewer-badge", text: "PDF" });
+
+    const fileName = vw.path.split("/").pop() || vw.path;
+    const titleEl = header.createSpan({ cls: "ink-pdf-viewer-title", text: fileName, attr: { title: vw.path } });
+
+    const nav = header.createDiv({ cls: "ink-pdf-viewer-nav" });
+    const prevBtn = nav.createEl("button", { cls: "ink-viewer-btn", text: "◀", attr: { title: "Vorherige Seite" } });
+    const pageLabelEl = nav.createSpan({ text: `${(vw.page || 0) + 1} / ?` });
+    const nextBtn = nav.createEl("button", { cls: "ink-viewer-btn", text: "▶", attr: { title: "Nächste Seite" } });
+
+    const extractBtn = header.createEl("button", {
+      cls: "ink-viewer-btn is-accent",
+      text: "+ Seite",
+      attr: { title: "Aktuelle Seite zum Beschriften neben den Viewer auf die Leinwand legen" },
+    });
+
+    const changeBtn = header.createEl("button", {
+      cls: "ink-viewer-btn",
+      text: "⇄",
+      attr: { title: "Eingebettete PDF-Datei ändern / austauschen" },
+    });
+
+    const openBtn = header.createEl("button", {
+      cls: "ink-viewer-btn",
+      text: "↗",
+      attr: { title: "PDF in neuem Obsidian-Tab öffnen" },
+    });
+
+    const closeBtn = header.createEl("button", {
+      cls: "ink-viewer-btn is-danger",
+      text: "✕",
+      attr: { title: "PDF-Viewer von der Leinwand entfernen" },
+    });
+
+    const bodyEl = el.createDiv({ cls: "ink-pdf-viewer-body" });
+    const resizeEl = el.createDiv({ cls: "ink-pdf-viewer-resize", attr: { title: "Größe ändern" } });
+
+    const item = { el, header, titleEl, bodyEl, pageLabelEl, pageEls: [], builtPages: false, io: null };
+
+    const stopDown = (ev) => ev.stopPropagation();
+    for (const b of [prevBtn, nextBtn, extractBtn, changeBtn, openBtn, closeBtn]) {
+      b.addEventListener("pointerdown", stopDown);
+    }
+
+    prevBtn.addEventListener("click", () => this.scrollViewerToPage(vw, item, (vw.page || 0) - 1));
+    nextBtn.addEventListener("click", () => this.scrollViewerToPage(vw, item, (vw.page || 0) + 1));
+    extractBtn.addEventListener("click", () => this.insertViewerPageToCanvas(vw));
+    changeBtn.addEventListener("click", () => {
+      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.refreshToolbar();
+      this.updateViewersTransform();
+      this.changePdfFile(vw, "viewer");
+    });
+    openBtn.addEventListener("click", () => this.openPdfLink(vw));
+    closeBtn.addEventListener("click", () => {
+      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.deleteSelection();
+    });
+
+    bodyEl.addEventListener("scroll", () => {
+      if (!item.pageEls.length) return;
+      const mid = bodyEl.scrollTop + bodyEl.clientHeight * 0.35;
+      let bestIdx = 0;
+      for (let i = 0; i < item.pageEls.length; i++) {
+        const pe = item.pageEls[i];
+        if (pe.offsetTop <= mid) bestIdx = i;
+        else break;
+      }
+      if (vw.page !== bestIdx) {
+        vw.page = bestIdx;
+        pageLabelEl.textContent = `${bestIdx + 1} / ${item.pageEls.length}`;
+        this.requestSave();
+      }
+    }, { passive: true });
+
+    bodyEl.addEventListener("wheel", (ev) => {
+      ev.stopPropagation();
+    }, { passive: true });
+
+    header.addEventListener("pointerdown", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      try { header.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
+      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.refreshToolbar();
+      this.updateViewersTransform();
+      const startP = this.local(ev);
+      let lastDoc = this.toDoc(startP);
+      let totalDx = 0, totalDy = 0;
+
+      const onMove = (me) => {
+        if (me.pointerId !== ev.pointerId) return;
+        const curDoc = this.toDoc(this.local(me));
+        const dx = curDoc.x - lastDoc.x, dy = curDoc.y - lastDoc.y;
+        vw.x += dx; vw.y += dy;
+        totalDx += dx; totalDy += dy;
+        lastDoc = curDoc;
+        this.updateViewersTransform();
+        this.requestDraw();
+      };
+      const onUp = (ue) => {
+        if (ue.pointerId !== ev.pointerId) return;
+        header.removeEventListener("pointermove", onMove);
+        header.removeEventListener("pointerup", onUp);
+        header.removeEventListener("pointercancel", onUp);
+        if (Math.abs(totalDx) > 0.5 || Math.abs(totalDy) > 0.5) {
+          this.pushUndo({ t: "move", entry: null, link: null, viewer: vw, strokes: [], dx: totalDx, dy: totalDy });
+          this.changed();
+        }
+      };
+      header.addEventListener("pointermove", onMove);
+      header.addEventListener("pointerup", onUp);
+      header.addEventListener("pointercancel", onUp);
+    });
+
+    resizeEl.addEventListener("pointerdown", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      try { resizeEl.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
+      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.refreshToolbar();
+      const startDoc = this.toDoc(this.local(ev));
+      const w0 = vw.w || VIEWER_W, h0 = vw.h || VIEWER_H;
+
+      const onMove = (me) => {
+        if (me.pointerId !== ev.pointerId) return;
+        const curDoc = this.toDoc(this.local(me));
+        vw.w = clamp(Math.round(w0 + (curDoc.x - startDoc.x)), 280, 1800);
+        vw.h = clamp(Math.round(h0 + (curDoc.y - startDoc.y)), 260, 2200);
+        this.updateViewersTransform();
+        this.requestDraw();
+      };
+      const onUp = (ue) => {
+        if (ue.pointerId !== ev.pointerId) return;
+        resizeEl.removeEventListener("pointermove", onMove);
+        resizeEl.removeEventListener("pointerup", onUp);
+        resizeEl.removeEventListener("pointercancel", onUp);
+        if (vw.w !== w0 || vw.h !== h0) {
+          this.pushUndo({ t: "viewerresize", viewer: vw, w0, h0, w1: vw.w, h1: vw.h });
+          this.changed();
+        }
+      };
+      resizeEl.addEventListener("pointermove", onMove);
+      resizeEl.addEventListener("pointerup", onUp);
+      resizeEl.addEventListener("pointercancel", onUp);
+    });
+
+    return item;
+  }
+
+  populateViewerPages(vw, item, d) {
+    item.builtPages = true;
+    item.bodyEl.empty();
+    item.pageEls = [];
+    const total = d.asp.length;
+    item.pageLabelEl.textContent = `${clamp((vw.page || 0) + 1, 1, total)} / ${total}`;
+
+    item.io = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (en.isIntersecting) {
+          const idx = parseInt(en.target.dataset.idx, 10);
+          this.renderViewerPageCanvas(vw, d, en.target, idx);
+        }
+      }
+    }, { root: item.bodyEl, rootMargin: "250px 0px" });
+
+    for (let i = 0; i < total; i++) {
+      const asp = d.asp[i] || 1.414;
+      const pageEl = item.bodyEl.createDiv({ cls: "ink-pdf-viewer-page" });
+      pageEl.dataset.idx = String(i);
+      pageEl.style.aspectRatio = `1 / ${asp}`;
+      pageEl.createSpan({ cls: "ink-pdf-viewer-page-num", text: `${i + 1}` });
+      item.pageEls.push(pageEl);
+      item.io.observe(pageEl);
+    }
+
+    if (vw.page > 0 && vw.page < total) {
+      setTimeout(() => this.scrollViewerToPage(vw, item, vw.page, false), 40);
+    }
+  }
+
+  async renderViewerPageCanvas(vw, d, pageEl, idx) {
+    if (pageEl.dataset.rendered === "1" || pageEl.dataset.rendering === "1") return;
+    pageEl.dataset.rendering = "1";
+    try {
+      const pg = await d.pdf.getPage(idx + 1);
+      const vp0 = pg.getViewport({ scale: 1 });
+      const targetW = Math.min(2000, Math.max(700, (vw.w || VIEWER_W) * 1.6));
+      const vp = pg.getViewport({ scale: targetW / vp0.width });
+      const cv = document.createElement("canvas");
+      cv.width = Math.max(1, Math.floor(vp.width));
+      cv.height = Math.max(1, Math.floor(vp.height));
+      await pg.render({ canvasContext: cv.getContext("2d"), canvas: cv, viewport: vp }).promise;
+      pageEl.prepend(cv);
+      pageEl.dataset.rendered = "1";
+    } catch (e) {
+      console.error("Viewer Page Render:", e);
+    } finally {
+      delete pageEl.dataset.rendering;
+    }
+  }
+
+  scrollViewerToPage(vw, item, targetIdx, smooth = true) {
+    if (!item.pageEls.length) return;
+    const idx = clamp(targetIdx, 0, item.pageEls.length - 1);
+    const pe = item.pageEls[idx];
+    if (!pe) return;
+    vw.page = idx;
+    item.pageLabelEl.textContent = `${idx + 1} / ${item.pageEls.length}`;
+    item.bodyEl.scrollTo({ top: pe.offsetTop - 8, behavior: smooth ? "smooth" : "auto" });
+    this.requestSave();
+  }
+
+  updateViewersTransform() {
+    if (!this.viewersLayer) return;
+    const v = this.doc.view;
+    for (const vw of (this.doc.viewers || [])) {
+      const item = this.viewerDom.get(vw.id);
+      if (!item) continue;
+      const w = vw.w || VIEWER_W;
+      const h = vw.h || VIEWER_H;
+      const sx = vw.x * v.z + v.x;
+      const sy = vw.y * v.z + v.y;
+      item.el.style.width = `${w}px`;
+      item.el.style.height = `${h}px`;
+      item.el.style.transform = `translate3d(${sx}px, ${sy}px, 0) scale(${v.z})`;
+      item.el.classList.toggle("is-selected", Boolean(this.sel && this.sel.viewer === vw));
+    }
+  }
+
   async openPdfLink(link) {
     const f = this.app.vault.getAbstractFileByPath(link.path);
     if (!(f instanceof TFile)) {
@@ -713,16 +1238,29 @@ class InkView extends TextFileView {
     return null;
   }
 
-  /** Prüft, ob direkt auf den "Öffnen"-Button rechts auf einer PDF-Anhang-Karte geklickt wurde. */
   hitLinkOpenButton(d) {
     const l = this.hitLink(d);
     if (!l) return null;
     const w = l.w || CARD_W;
     const s = w / CARD_W;
     const h = CARD_H * s;
-    const btnW = 64 * s, btnH = 36 * s;
-    const btnX = l.x + w - btnW - 10 * s, btnY = l.y + (h - btnH) / 2;
+    const btnW = 62 * s, btnH = 36 * s;
+    const btnX = l.x + w - btnW - 8 * s, btnY = l.y + (h - btnH) / 2;
     if (d.x >= btnX && d.x <= btnX + btnW && d.y >= btnY && d.y <= btnY + btnH) return l;
+    return null;
+  }
+
+  hitLinkChangeButton(d) {
+    const l = this.hitLink(d);
+    if (!l) return null;
+    const w = l.w || CARD_W;
+    const s = w / CARD_W;
+    const h = CARD_H * s;
+    const chgW = 34 * s, chgH = 36 * s;
+    const btnW = 58 * s;
+    const btnX = l.x + w - btnW - 10 * s;
+    const chgX = btnX - chgW - 4 * s, chgY = l.y + (h - chgH) / 2;
+    if (d.x >= chgX && d.x <= chgX + chgW && d.y >= chgY && d.y <= chgY + chgH) return l;
     return null;
   }
 
@@ -757,6 +1295,10 @@ class InkView extends TextFileView {
       const l = s.link;
       return { x0: l.x, y0: l.y, x1: l.x + (l.w || CARD_W), y1: l.y + this.linkHeight(l) };
     }
+    if (s.viewer) {
+      const vw = s.viewer;
+      return { x0: vw.x, y0: vw.y, x1: vw.x + (vw.w || VIEWER_W), y1: vw.y + (vw.h || VIEWER_H) };
+    }
     if (!s.strokes.length) return null;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const st of s.strokes) {
@@ -769,7 +1311,7 @@ class InkView extends TextFileView {
 
   hitHandle(p) {
     const b = this.selBounds();
-    if (!b) return null;
+    if (!b || (this.sel && this.sel.viewer)) return null;
     const v = this.doc.view;
     const corners = [
       { hx: b.x1, hy: b.y1, ox: b.x0, oy: b.y0 },
@@ -804,6 +1346,13 @@ class InkView extends TextFileView {
         d.links.splice(i, 1);
         this.pushUndo({ t: "linkdel", link: s.link, i });
       }
+    } else if (s.viewer) {
+      const i = d.viewers.indexOf(s.viewer);
+      if (i >= 0) {
+        d.viewers.splice(i, 1);
+        this.pushUndo({ t: "viewerdel", viewer: s.viewer, i });
+        this.syncViewerDoms();
+      }
     } else if (s.strokes.length) {
       const set = new Set(s.strokes);
       const items = [];
@@ -821,14 +1370,14 @@ class InkView extends TextFileView {
 
   duplicateSelection() {
     const s = this.sel;
-    if (!s || s.entry || s.link || !s.strokes.length) return;
+    if (!s || s.entry || s.link || s.viewer || !s.strokes.length) return;
     const copies = s.strokes.map((o) => ({
       tool: o.tool, color: o.color, width: o.width, sharp: o.sharp,
       points: o.points.map((p) => [p[0] + 30, p[1] + 30, p[2]]),
     }));
     this.doc.strokes.push(...copies);
     this.pushUndo({ t: "addmany", list: copies });
-    this.sel = { entry: null, link: null, strokes: copies };
+    this.sel = { entry: null, link: null, viewer: null, strokes: copies };
     this.changed();
   }
 
@@ -836,6 +1385,15 @@ class InkView extends TextFileView {
     const s = this.sel;
     const b = this.selBounds();
     if (!s || !b) return;
+    if (s.viewer) {
+      const w0 = s.viewer.w || VIEWER_W, h0 = s.viewer.h || VIEWER_H;
+      s.viewer.w = clamp(Math.round(w0 * k), 280, 1800);
+      s.viewer.h = clamp(Math.round(h0 * k), 260, 2200);
+      this.pushUndo({ t: "viewerresize", viewer: s.viewer, w0, h0, w1: s.viewer.w, h1: s.viewer.h });
+      this.updateViewersTransform();
+      this.changed();
+      return;
+    }
     if (s.entry) k = clamp(k, 100 / s.entry.w, 6000 / s.entry.w);
     if (s.link) k = clamp(k, 160 / s.link.w, 1200 / s.link.w);
     const ox = s.entry ? s.entry.x : s.link ? s.link.x : b.x0;
@@ -894,6 +1452,10 @@ class InkView extends TextFileView {
     for (const l of (this.doc.links || [])) {
       x0 = Math.min(x0, l.x); y0 = Math.min(y0, l.y);
       x1 = Math.max(x1, l.x + (l.w || CARD_W)); y1 = Math.max(y1, l.y + this.linkHeight(l));
+    }
+    for (const vw of (this.doc.viewers || [])) {
+      x0 = Math.min(x0, vw.x); y0 = Math.min(y0, vw.y);
+      x1 = Math.max(x1, vw.x + (vw.w || VIEWER_W)); y1 = Math.max(y1, vw.y + (vw.h || VIEWER_H));
     }
     for (const s of this.doc.strokes) {
       const b = strokeBounds(s);
@@ -977,6 +1539,39 @@ class InkView extends TextFileView {
         if (reverse) d.links.splice(a.i, 0, a.link);
         else d.links = d.links.filter((l) => l !== a.link);
         break;
+      case "vieweradd":
+        if (reverse) d.viewers = d.viewers.filter((v) => v !== a.viewer);
+        else d.viewers.push(a.viewer);
+        this.syncViewerDoms();
+        break;
+      case "viewerdel":
+        if (reverse) d.viewers.splice(a.i, 0, a.viewer);
+        else d.viewers = d.viewers.filter((v) => v !== a.viewer);
+        this.syncViewerDoms();
+        break;
+      case "viewerresize":
+        a.viewer.w = reverse ? a.w0 : a.w1;
+        a.viewer.h = reverse ? a.h0 : a.h1;
+        this.updateViewersTransform();
+        break;
+      case "pdfchange": {
+        const nextPath = reverse ? a.oldPath : a.newPath;
+        const nextPage = reverse ? a.oldPage : a.newPage;
+        a.target.path = nextPath;
+        if (a.targetType === "entry") {
+          a.target.page = nextPage;
+          a.target._lay = null;
+          a.target._lw = null;
+          a.target._ld = null;
+          a.target._lp = null;
+          this.ensureDoc(nextPath).then(() => this.invalidateStatic()).catch(() => {});
+        } else if (a.targetType === "viewer") {
+          a.target.page = nextPage || 0;
+          this.ensureDoc(nextPath).then(() => this.refreshViewerDom(a.target)).catch(() => {});
+          this.refreshViewerDom(a.target);
+        }
+        break;
+      }
       case "ungroup":
         if (reverse) {
           const i = d.pdfs.indexOf(a.list[0]);
@@ -990,6 +1585,7 @@ class InkView extends TextFileView {
         const sg = reverse ? -1 : 1;
         if (a.entry) { a.entry.x += sg * a.dx; a.entry.y += sg * a.dy; }
         if (a.link) { a.link.x += sg * a.dx; a.link.y += sg * a.dy; }
+        if (a.viewer) { a.viewer.x += sg * a.dx; a.viewer.y += sg * a.dy; this.updateViewersTransform(); }
         shiftStrokes(a.strokes, sg * a.dx, sg * a.dy);
         break;
       }
@@ -1009,12 +1605,17 @@ class InkView extends TextFileView {
     this.refreshToolbar();
   }
 
-  /* ----- UI (PC-Optik + Custom Color Picker + PDF-Menü) ----- */
+  /* ----- Clean Tablet UI (v2.1.0) ----- */
   buildUI() {
     const root = this.contentEl;
     this.toolbar = root.createDiv({ cls: "ink-toolbar" });
     this.wrap = root.createDiv({ cls: "ink-canvas-wrap" });
     this.canvas = this.wrap.createEl("canvas", { cls: "ink-canvas" });
+    this.viewersLayer = this.wrap.createDiv({ cls: "ink-viewers-layer" });
+
+    // Schwebendes Popover für Strichstärke & Glättung
+    this.strokePopover = this.wrap.createDiv({ cls: "ink-popover" });
+    this.buildStrokePopover();
 
     this.zoomBadge = this.wrap.createEl("button", {
       cls: "ink-hud-zoom",
@@ -1032,99 +1633,168 @@ class InkView extends TextFileView {
     setIcon(this.uncollapseBtn, "chevron-down");
     this.uncollapseBtn.addEventListener("click", () => this.toggleToolbar(false));
 
-    const mk = (icon, label, fn) => {
-      const b = this.toolbar.createEl("button", { cls: "ink-btn", attr: { "aria-label": label, title: label } });
+    const mkBtn = (parent, icon, label, fn) => {
+      const b = parent.createEl("button", { cls: "ink-btn", attr: { "aria-label": label, title: label } });
       setIcon(b, icon);
       b.addEventListener("click", (ev) => fn(ev));
       return b;
     };
-    const sep = () => this.toolbar.createDiv({ cls: "ink-sep" });
-    const slider = (icon, label, min, max, step, value, fmt, onInput) => {
-      const grp = this.toolbar.createDiv({ cls: "ink-slider-group", attr: { title: label } });
-      const ic = grp.createDiv({ cls: "ink-ico" });
-      setIcon(ic, icon);
-      const inp = grp.createEl("input", {
-        cls: "ink-width",
-        attr: { type: "range", min: String(min), max: String(max), step: String(step), title: label },
-      });
-      inp.value = String(value);
-      const valEl = grp.createSpan({ cls: "ink-val-label", text: fmt(value) });
-      inp.addEventListener("input", () => {
-        const v = parseFloat(inp.value);
-        valEl.textContent = fmt(v);
-        onInput(v);
-      });
-      return inp;
-    };
 
-    this.btnPen = mk("pencil", "Stift", () => this.setTool("pen"));
-    this.btnHl = mk("highlighter", "Textmarker", () => this.setTool("highlighter"));
-    this.btnEr = mk("eraser", "Radierer (Strich löschen)", () => this.setTool("eraser"));
-    this.btnLasso = mk("lasso-select", "Lasso: Antippen oder einkreisen, verschieben, skalieren", () => this.setTool("lasso"));
-    this.btnMove = mk("move", "Verschieben: PDF/Anhang wählen & ziehen, Fläche schieben", () => this.setTool("move"));
-    sep();
-    this.colorBox = this.toolbar.createDiv({ cls: "ink-colors" });
-    slider("minus", "Strichstärke", 1, 14, 0.5, this.width, (v) => v.toFixed(1), (v) => {
-      this.width = v;
-      this.plugin.settings.penWidth = v;
-      this.plugin.saveSettings();
-    });
-    slider("waves", "Glättung der Handschrift", 0, 1, 0.05, this.plugin.settings.smoothing, (v) => Math.round(v * 100) + "%", (v) => {
-      this.plugin.settings.smoothing = v;
-      this.plugin.saveSettings();
-    });
-    sep();
-    this.btnUndo = mk("undo-2", "Rückgängig (2-Finger-Tippen)", () => this.undo());
-    this.btnRedo = mk("redo-2", "Wiederholen (3-Finger-Tippen)", () => this.redo());
-    sep();
+    // 1. Haupt-Werkzeuge (Pille)
+    const toolsGroup = this.toolbar.createDiv({ cls: "ink-tool-group" });
+    this.btnPen = mkBtn(toolsGroup, "pencil", "Stift", () => this.setTool("pen"));
+    this.btnHl = mkBtn(toolsGroup, "highlighter", "Textmarker", () => this.setTool("highlighter"));
+    this.btnEr = mkBtn(toolsGroup, "eraser", "Radierer", () => this.setTool("eraser"));
+    this.btnLasso = mkBtn(toolsGroup, "lasso-select", "Lasso-Auswahl", () => this.setTool("lasso"));
+    this.btnMove = mkBtn(toolsGroup, "hand", "Bewegen / PDF auswählen", () => this.setTool("move"));
 
-    // PDF-Menü: Auswahl zwischen "Als Ausdruck" und "Als Anhang-Karte verknüpfen"
-    mk("file-plus", "PDF einfügen (als Ausdruck oder als verknüpfter Anhang)", (ev) => {
+    // 2. Farben & Strichstärke-Trigger (nur bei Stift/Marker sichtbar)
+    this.styleGroup = this.toolbar.createDiv({ cls: "ink-tool-group ink-style-group" });
+    this.colorBox = this.styleGroup.createDiv({ cls: "ink-colors" });
+    this.btnStrokePopover = this.styleGroup.createEl("button", {
+      cls: "ink-btn ink-stroke-trigger",
+      attr: { title: "Strichstärke & Glättung anpassen" },
+    });
+    this.strokePreviewDot = this.btnStrokePopover.createDiv({ cls: "ink-stroke-dot" });
+    this.btnStrokePopover.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      this.toggleStrokePopover();
+    });
+
+    // 3. Dynamische Kontext-Aktionen (NUR sichtbar, wenn etwas mit Lasso/Hand/Viewer ausgewählt ist!)
+    this.contextGroup = this.toolbar.createDiv({ cls: "ink-tool-group ink-context-group is-hidden" });
+    this.btnChangePdf = mkBtn(this.contextGroup, "refresh-cw", "Eingebettete PDF-Datei ändern / austauschen", () => {
+      this.changeSelectedPdf();
+    });
+    this.btnOpenLink = mkBtn(this.contextGroup, "external-link", "PDF in neuem Tab öffnen", () => {
+      if (this.sel && this.sel.link) this.openPdfLink(this.sel.link);
+      else if (this.sel && this.sel.entry) this.openPdfLink(this.sel.entry);
+      else if (this.sel && this.sel.viewer) this.openPdfLink(this.sel.viewer);
+    });
+    this.btnUngroup = mkBtn(this.contextGroup, "ungroup", "PDF in Einzelseiten aufteilen", () => this.ungroupSelection());
+    this.btnShrink = mkBtn(this.contextGroup, "minimize-2", "Verkleinern", () => this.scaleSelection(1 / 1.12));
+    this.btnGrow = mkBtn(this.contextGroup, "maximize-2", "Vergrößern", () => this.scaleSelection(1.12));
+    this.btnDup = mkBtn(this.contextGroup, "copy", "Duplizieren", () => this.duplicateSelection());
+    this.btnDel = mkBtn(this.contextGroup, "trash-2", "Auswahl löschen", () => this.deleteSelection());
+    this.btnDel.classList.add("is-danger-icon");
+
+    // 4. Undo / Redo & PDF & Mehr-Menü
+    const rightGroup = this.toolbar.createDiv({ cls: "ink-tool-group" });
+    this.btnUndo = mkBtn(rightGroup, "undo-2", "Rückgängig (2-Finger-Tippen)", () => this.undo());
+    this.btnRedo = mkBtn(rightGroup, "redo-2", "Wiederholen (3-Finger-Tippen)", () => this.redo());
+
+    mkBtn(rightGroup, "file-plus", "PDF einfügen oder eingebettete PDF ändern", (ev) => {
       const menu = new Menu();
       menu.addItem((item) =>
         item
-          .setTitle("PDF als Ausdruck einfügen (Seiten zum Beschriften)")
+          .setTitle("PDF als Viewer-Fenster einbetten")
+          .setIcon("layout-panel-left")
+          .onClick(() => this.plugin.pickPdf((f) => this.addPdfViewer(f)))
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("PDF als Seiten-Ausdruck einfügen")
           .setIcon("file-text")
           .onClick(() => this.plugin.pickPdf((f) => this.addPdf(f)))
       );
       menu.addItem((item) =>
         item
-          .setTitle("PDF als Anhang-Karte verknüpfen (Kompakter Link)")
+          .setTitle("PDF als Anhang-Karte verknüpfen")
           .setIcon("paperclip")
           .onClick(() => this.plugin.pickPdf((f) => this.addPdfLink(f)))
+      );
+
+      const s = this.sel;
+      const hasSelPdf = Boolean(s && (s.entry || s.link || s.viewer));
+      const allEmbedded = this.getAllEmbeddedPdfs();
+      if (hasSelPdf || allEmbedded.length > 0) {
+        menu.addSeparator();
+        if (hasSelPdf) {
+          const curTarget = s.entry || s.link || s.viewer;
+          const curName = curTarget.path ? (curTarget.path.split("/").pop() || curTarget.path) : "PDF";
+          menu.addItem((item) =>
+            item
+              .setTitle(`Ausgewählte PDF ändern (${curName}) …`)
+              .setIcon("refresh-cw")
+              .onClick(() => this.changeSelectedPdf())
+          );
+        }
+        if (allEmbedded.length > 0) {
+          menu.addItem((item) =>
+            item
+              .setTitle("Bereits eingebettete PDF-Datei ändern …")
+              .setIcon("refresh-cw")
+              .onClick(() => this.promptChangeAnyEmbeddedPdf(ev))
+          );
+        }
+      }
+      menu.showAtMouseEvent(ev);
+    });
+
+    mkBtn(rightGroup, "more-horizontal", "Weitere Optionen & Ansicht", (ev) => {
+      const menu = new Menu();
+      menu.addItem((item) =>
+        item
+          .setTitle(`Hintergrund: ${BG_LABELS[this.doc.bg]} (wechseln)`)
+          .setIcon("grid-3x3")
+          .onClick(() => {
+            const i = BGS.indexOf(this.doc.bg);
+            this.doc.bg = BGS[(i + 1) % BGS.length];
+            new Notice("Hintergrund: " + BG_LABELS[this.doc.bg]);
+            this.changed();
+          })
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle(`Formerkennung beim Halten: ${this.plugin.settings.shapeRecognition ? "An ✓" : "Aus"}`)
+          .setIcon("shapes")
+          .onClick(() => {
+            this.plugin.settings.shapeRecognition = !this.plugin.settings.shapeRecognition;
+            this.plugin.saveSettings();
+            new Notice(`Formerkennung: ${this.plugin.settings.shapeRecognition ? "An" : "Aus"}`);
+          })
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle(`Mit Finger zeichnen: ${this.plugin.settings.fingerDraws ? "An ✓" : "Aus"}`)
+          .setIcon("hand")
+          .onClick(() => {
+            this.plugin.settings.fingerDraws = !this.plugin.settings.fingerDraws;
+            this.plugin.saveSettings();
+            new Notice(`Mit Finger zeichnen: ${this.plugin.settings.fingerDraws ? "An" : "Aus"}`);
+          })
+      );
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("Alles anzeigen (Zoom anpassen)")
+          .setIcon("maximize")
+          .onClick(() => this.fitAll())
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Als PNG-Bild exportieren")
+          .setIcon("image-down")
+          .onClick(() => this.exportPng())
+      );
+      menu.addSeparator();
+      menu.addItem((item) =>
+        item
+          .setTitle("Werkzeugleiste ausblenden (Vollbild)")
+          .setIcon("chevron-up")
+          .onClick(() => this.toggleToolbar(true))
       );
       menu.showAtMouseEvent(ev);
     });
 
-    this.btnOpenLink = mk("external-link", "Verknüpftes PDF öffnen", () => {
-      if (this.sel && this.sel.link) this.openPdfLink(this.sel.link);
-      else if (this.sel && this.sel.entry) this.openPdfLink(this.sel.entry);
-    });
-    this.btnUngroup = mk("ungroup", "PDF in Einzelseiten aufteilen (entgruppieren)", () => this.ungroupSelection());
-    this.btnGrow = mk("expand", "Auswahl vergrößern", () => this.scaleSelection(1.1));
-    this.btnShrink = mk("shrink", "Auswahl verkleinern", () => this.scaleSelection(1 / 1.1));
-    this.btnDup = mk("copy", "Auswahl duplizieren", () => this.duplicateSelection());
-    this.btnDel = mk("trash-2", "Auswahl löschen", () => this.deleteSelection());
-    sep();
-    this.btnShape = mk("shapes", "Formerkennung beim Halten (an/aus)", () => {
-      this.plugin.settings.shapeRecognition = !this.plugin.settings.shapeRecognition;
-      this.plugin.saveSettings();
-      this.refreshToolbar();
-    });
-    this.btnFinger = mk("hand", "Mit Finger zeichnen (an/aus)", () => {
-      this.plugin.settings.fingerDraws = !this.plugin.settings.fingerDraws;
-      this.plugin.saveSettings();
-      this.refreshToolbar();
-    });
-    this.btnBg = mk("grid-3x3", "Hintergrund wechseln", () => {
-      const i = BGS.indexOf(this.doc.bg);
-      this.doc.bg = BGS[(i + 1) % BGS.length];
-      new Notice("Hintergrund: " + BG_LABELS[this.doc.bg]);
-      this.changed();
-    });
-    mk("maximize", "Alles anzeigen", () => this.fitAll());
-    mk("image-down", "Als PNG exportieren", () => this.exportPng());
-    mk("chevron-up", "Werkzeugleiste ausblenden (Vollbild)", () => this.toggleToolbar(true));
+    this._outsideClickHandler = (ev) => {
+      if (this.strokePopover && this.strokePopover.classList.contains("is-open")) {
+        if (!this.strokePopover.contains(ev.target) && !this.btnStrokePopover.contains(ev.target)) {
+          this.strokePopover.classList.remove("is-open");
+        }
+      }
+    };
+    window.addEventListener("pointerdown", this._outsideClickHandler, true);
 
     this.bindEvents();
 
@@ -1132,117 +1802,272 @@ class InkView extends TextFileView {
     this.ro.observe(this.wrap);
     this.resize();
     this.refreshToolbar();
+    this.syncViewerDoms();
+  }
+
+  buildStrokePopover() {
+    this.strokePopover.empty();
+    const stop = (e) => e.stopPropagation();
+    this.strokePopover.addEventListener("pointerdown", stop);
+
+    // Schnellauswahl-Buttons für Strichstärke
+    const presetsRow = this.strokePopover.createDiv({ cls: "ink-popover-presets" });
+    const presets = [1.5, 2.5, 4, 7, 11];
+    for (const pVal of presets) {
+      const btn = presetsRow.createEl("button", {
+        cls: "ink-preset-btn",
+        attr: { title: `Stärke ${pVal}` },
+      });
+      const dot = btn.createDiv({ cls: "ink-preset-dot" });
+      const sz = clamp(Math.round(pVal * 1.4 + 3), 4, 18);
+      dot.style.width = `${sz}px`;
+      dot.style.height = `${sz}px`;
+      btn.addEventListener("click", () => {
+        this.width = pVal;
+        this.plugin.settings.penWidth = pVal;
+        this.plugin.saveSettings();
+        if (this.widthSliderEl) this.widthSliderEl.value = String(pVal);
+        if (this.widthValLabel) this.widthValLabel.textContent = pVal.toFixed(1);
+        this.updateStrokeTriggerPreview();
+      });
+    }
+
+    // Feineinstellung Strichstärke
+    const rowW = this.strokePopover.createDiv({ cls: "ink-popover-row" });
+    rowW.createSpan({ cls: "ink-popover-label", text: "Stärke" });
+    this.widthSliderEl = rowW.createEl("input", {
+      cls: "ink-width",
+      attr: { type: "range", min: "1", max: "14", step: "0.5" },
+    });
+    this.widthSliderEl.value = String(this.width);
+    this.widthValLabel = rowW.createSpan({ cls: "ink-val-label", text: this.width.toFixed(1) });
+    this.widthSliderEl.addEventListener("input", () => {
+      const v = parseFloat(this.widthSliderEl.value);
+      this.width = v;
+      this.widthValLabel.textContent = v.toFixed(1);
+      this.plugin.settings.penWidth = v;
+      this.plugin.saveSettings();
+      this.updateStrokeTriggerPreview();
+    });
+
+    // Glättung
+    const rowS = this.strokePopover.createDiv({ cls: "ink-popover-row" });
+    rowS.createSpan({ cls: "ink-popover-label", text: "Glättung" });
+    const smSlider = rowS.createEl("input", {
+      cls: "ink-width",
+      attr: { type: "range", min: "0", max: "1", step: "0.05" },
+    });
+    smSlider.value = String(this.plugin.settings.smoothing);
+    const smVal = rowS.createSpan({ cls: "ink-val-label", text: Math.round(this.plugin.settings.smoothing * 100) + "%" });
+    smSlider.addEventListener("input", () => {
+      const v = parseFloat(smSlider.value);
+      smVal.textContent = Math.round(v * 100) + "%";
+      this.plugin.settings.smoothing = v;
+      this.plugin.saveSettings();
+    });
+  }
+
+  toggleStrokePopover() {
+    if (!this.strokePopover) return;
+    const open = !this.strokePopover.classList.contains("is-open");
+    if (open && this.btnStrokePopover) {
+      const rBtn = this.btnStrokePopover.getBoundingClientRect();
+      const rWrap = this.wrap.getBoundingClientRect();
+      const left = clamp(rBtn.left - rWrap.left - 90, 10, Math.max(10, this.cssW - 240));
+      this.strokePopover.style.left = `${left}px`;
+    }
+    this.strokePopover.classList.toggle("is-open", open);
+  }
+
+  updateStrokeTriggerPreview() {
+    if (!this.strokePreviewDot) return;
+    const isPen = this.tool !== "highlighter";
+    const col = isPen ? this.penColor : this.hlColor;
+    const sz = clamp(Math.round(this.width * 1.3 + 4), 5, 20);
+    this.strokePreviewDot.style.width = `${sz}px`;
+    this.strokePreviewDot.style.height = `${sz}px`;
+    this.strokePreviewDot.style.background = col;
   }
 
   toggleToolbar(collapse) {
     this.toolbar.classList.toggle("is-collapsed", collapse);
     this.uncollapseBtn.classList.toggle("is-visible", collapse);
+    if (collapse && this.strokePopover) this.strokePopover.classList.remove("is-open");
     setTimeout(() => this.resize(), 20);
   }
 
   setTool(t) {
     if (t !== this.tool) { this.sel = null; this.lasso = null; }
     this.tool = t;
+    this.barrelHeld = false;
+    this.contextMenuBarrel = false;
+    if (t !== "eraser") this.eraserPos = null;
+    if (this.strokePopover) this.strokePopover.classList.remove("is-open");
     this.refreshToolbar();
+    this.updateViewersTransform();
     this.requestDraw();
+  }
+
+  /**
+   * Liefert das aktuell wirksame Werkzeug unter Berücksichtigung der gehaltenen S-Pen-Seitentaste.
+   * Solange `this.barrelHeld` aktiv ist, wird temporär auf `eraser` (bzw. `move`) umgeschaltet,
+   * ohne dass `this.tool` (der vorher benutzte Stift) verloren geht!
+   */
+  getEffectiveTool() {
+    if (this.barrelHeld && this.plugin.settings.penButton !== "off") {
+      return this.plugin.settings.penButton === "eraser" ? "eraser" : "move";
+    }
+    return this.tool;
+  }
+
+  removeCustomColor(colorHex, isPen) {
+    const target = colorHex.toLowerCase();
+    if (isPen) {
+      this.plugin.settings.customPenColors = (this.plugin.settings.customPenColors || [])
+        .filter((x) => x.toLowerCase() !== target);
+      if (this.penColor.toLowerCase() === target) {
+        const remaining = this.plugin.settings.customPenColors;
+        this.penColor = remaining.length ? remaining[remaining.length - 1] : DEFAULT_PEN_COLORS[0];
+      }
+    } else {
+      this.plugin.settings.customHlColors = (this.plugin.settings.customHlColors || [])
+        .filter((x) => x.toLowerCase() !== target);
+      if (this.hlColor.toLowerCase() === target) {
+        const remaining = this.plugin.settings.customHlColors;
+        this.hlColor = remaining.length ? remaining[remaining.length - 1] : DEFAULT_HL_COLORS[0];
+      }
+    }
+    this.plugin.saveSettings();
+    this.refreshToolbar();
+    new Notice(`Eigene Farbe ${target} gelöscht.`);
   }
 
   refreshToolbar() {
     if (!this.btnPen) return;
+    const effTool = this.getEffectiveTool();
+    const isBarrelOverride = this.barrelHeld && this.plugin.settings.penButton !== "off";
     const act = (b, on) => b.classList.toggle("is-active", !!on);
-    act(this.btnPen, this.tool === "pen");
-    act(this.btnHl, this.tool === "highlighter");
-    act(this.btnEr, this.tool === "eraser");
-    act(this.btnLasso, this.tool === "lasso");
-    act(this.btnMove, this.tool === "move");
-    act(this.btnFinger, this.plugin.settings.fingerDraws);
-    act(this.btnShape, this.plugin.settings.shapeRecognition);
+    act(this.btnPen, effTool === "pen");
+    act(this.btnHl, effTool === "highlighter");
+    act(this.btnEr, effTool === "eraser");
+    act(this.btnLasso, effTool === "lasso");
+    act(this.btnMove, effTool === "move");
+    this.btnEr.classList.toggle("is-barrel-override", Boolean(isBarrelOverride && effTool === "eraser"));
     this.btnUndo.disabled = !this.undoStack.length;
     this.btnRedo.disabled = !this.redoStack.length;
 
+    // Dynamische Kontext-Pille nur einblenden, wenn eine Auswahl existiert
     const s = this.sel;
-    this.btnDel.disabled = !s;
-    this.btnGrow.disabled = !s;
-    this.btnShrink.disabled = !s;
-    this.btnDup.disabled = !(s && !s.entry && !s.link && s.strokes.length);
-    this.btnOpenLink.disabled = !(s && (s.link || s.entry));
-    const lay = s && s.entry ? this.entryLayout(s.entry) : null;
-    this.btnUngroup.disabled = !(s && s.entry && s.entry.page == null && lay && lay.pages.length > 1);
+    const hasSel = Boolean(s && (s.entry || s.link || s.viewer || (s.strokes && s.strokes.length)));
+    this.contextGroup.classList.toggle("is-hidden", !hasSel);
+    if (hasSel) {
+      const canDup = Boolean(!s.entry && !s.link && !s.viewer && s.strokes.length);
+      const isPdfTarget = Boolean(s.link || s.entry || s.viewer);
+      const lay = s.entry ? this.entryLayout(s.entry) : null;
+      const canUngroup = Boolean(s.entry && s.entry.page == null && lay && lay.pages.length > 1);
 
+      this.btnChangePdf.classList.toggle("is-hidden", !isPdfTarget);
+      this.btnOpenLink.classList.toggle("is-hidden", !isPdfTarget);
+      this.btnDup.classList.toggle("is-hidden", !canDup);
+      this.btnUngroup.classList.toggle("is-hidden", !canUngroup);
+    }
+
+    // Farb-Pille bleibt bei Stift/Textmarker sichtbar (damit die Toolbar beim Drücken der S-Pen-Taste nicht springt)
+    const showColors = this.tool === "pen" || this.tool === "highlighter";
+    this.styleGroup.classList.toggle("is-hidden", !showColors);
     this.colorBox.empty();
-    if (this.tool === "pen" || this.tool === "highlighter") {
+
+    if (showColors) {
       const isPen = this.tool === "pen";
       const defaults = isPen ? DEFAULT_PEN_COLORS : DEFAULT_HL_COLORS;
-      const customs = (isPen ? this.plugin.settings.customPenColors : this.plugin.settings.customHlColors) || [];
-      const allColors = [...defaults, ...customs.filter((c) => !defaults.includes(c))];
-      const cur = isPen ? this.penColor : this.hlColor;
+      const customs = ((isPen ? this.plugin.settings.customPenColors : this.plugin.settings.customHlColors) || [])
+        .filter((c) => !defaults.includes(c.toLowerCase()))
+        .slice(-MAX_CUSTOM_COLORS);
+      const allColors = [...defaults, ...customs];
+      const cur = (isPen ? this.penColor : this.hlColor).toLowerCase();
+      let isCurrentCustom = false;
 
       for (const c of allColors) {
-        const isCustom = customs.includes(c) && !defaults.includes(c);
+        const cLow = c.toLowerCase();
+        const isCustom = customs.some((x) => x.toLowerCase() === cLow);
+        if (isCustom && cLow === cur) isCurrentCustom = true;
+
         const sw = this.colorBox.createEl("button", {
-          cls: "ink-swatch",
+          cls: "ink-swatch" + (isCustom ? " is-custom" : ""),
           attr: {
             "aria-label": c,
-            title: isCustom ? `${c} (Rechtsklick / lang drücken zum Entfernen)` : c,
+            title: isCustom
+              ? `Eigene Farbe ${c} (× drücken oder 0,5s halten zum Löschen)`
+              : c,
           },
         });
         sw.style.background = c;
-        if (c.toLowerCase() === cur.toLowerCase()) sw.classList.add("is-active");
+        if (cLow === cur) sw.classList.add("is-active");
+
         sw.addEventListener("click", () => {
           if (isPen) this.penColor = c; else this.hlColor = c;
           this.refreshToolbar();
         });
+
         if (isCustom) {
-          const removeCustomColor = (ev) => {
+          sw.addEventListener("contextmenu", (ev) => {
             ev.preventDefault();
-            if (isPen) {
-              this.plugin.settings.customPenColors = customs.filter((x) => x !== c);
-              if (this.penColor === c) this.penColor = DEFAULT_PEN_COLORS[0];
-            } else {
-              this.plugin.settings.customHlColors = customs.filter((x) => x !== c);
-              if (this.hlColor === c) this.hlColor = DEFAULT_HL_COLORS[0];
-            }
-            this.plugin.saveSettings();
-            this.refreshToolbar();
-            new Notice(`Eigene Farbe ${c} entfernt.`);
-          };
-          sw.addEventListener("contextmenu", removeCustomColor);
+            this.removeCustomColor(c, isPen);
+          });
+          let pressTimer = null;
+          sw.addEventListener("pointerdown", () => {
+            pressTimer = setTimeout(() => {
+              pressTimer = null;
+              this.removeCustomColor(c, isPen);
+            }, 500);
+          });
+          const clearPress = () => { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } };
+          sw.addEventListener("pointerup", clearPress);
+          sw.addEventListener("pointerleave", clearPress);
+          sw.addEventListener("pointercancel", clearPress);
         }
       }
 
-      // Custom Color Picker (+) für eigene Stift- & Textmarker-Farben
       const pickerWrap = this.colorBox.createDiv({
         cls: "ink-color-picker-wrap",
-        attr: { title: "Eigene Farbe auswählen & speichern" },
+        attr: { title: `Eigene Farbe hinzufügen (${customs.length}/${MAX_CUSTOM_COLORS})` },
       });
       pickerWrap.createDiv({ cls: "ink-color-picker-btn", text: "+" });
       const colorInp = pickerWrap.createEl("input", {
         cls: "ink-color-input",
         attr: { type: "color", value: cur },
       });
-      // Live-Farbwechsel beim Ziehen im Farbwähler
       colorInp.addEventListener("input", () => {
-        const val = colorInp.value;
+        const val = colorInp.value.toLowerCase();
         if (isPen) this.penColor = val; else this.hlColor = val;
+        this.updateStrokeTriggerPreview();
       });
-      // Beim Schließen des Wählers in den eigenen Farben speichern
       colorInp.addEventListener("change", () => {
         const val = colorInp.value.toLowerCase();
-        if (isPen) {
-          this.penColor = val;
-          if (!DEFAULT_PEN_COLORS.includes(val) && !this.plugin.settings.customPenColors.includes(val)) {
-            this.plugin.settings.customPenColors.push(val);
-            this.plugin.saveSettings();
-          }
-        } else {
-          this.hlColor = val;
-          if (!DEFAULT_HL_COLORS.includes(val) && !this.plugin.settings.customHlColors.includes(val)) {
-            this.plugin.settings.customHlColors.push(val);
-            this.plugin.saveSettings();
-          }
+        const arr = isPen ? this.plugin.settings.customPenColors : this.plugin.settings.customHlColors;
+        const defList = isPen ? DEFAULT_PEN_COLORS : DEFAULT_HL_COLORS;
+
+        if (isPen) this.penColor = val; else this.hlColor = val;
+
+        if (!defList.includes(val)) {
+          const existingIdx = arr.findIndex((x) => x.toLowerCase() === val);
+          if (existingIdx >= 0) arr.splice(existingIdx, 1);
+          arr.push(val);
+          while (arr.length > MAX_CUSTOM_COLORS) arr.shift();
+          this.plugin.saveSettings();
         }
         this.refreshToolbar();
       });
+
+      if (isCurrentCustom) {
+        const delBtn = this.colorBox.createEl("button", {
+          cls: "ink-swatch-del",
+          text: "×",
+          attr: { title: `Eigene Farbe (${cur}) löschen` },
+        });
+        delBtn.addEventListener("click", () => this.removeCustomColor(cur, isPen));
+      }
+      this.updateStrokeTriggerPreview();
     }
   }
 
@@ -1266,6 +2091,7 @@ class InkView extends TextFileView {
   /* ----- Rendering mit 120Hz Offscreen-Layer-Cache ----- */
   invalidateStatic() {
     this.staticDirty = true;
+    this.updateViewersTransform();
     this.requestDraw();
   }
 
@@ -1323,7 +2149,6 @@ class InkView extends TextFileView {
     const vx0 = -v.x / v.z, vy0 = -v.y / v.z;
     const vx1 = (this.cssW - v.x) / v.z, vy1 = (this.cssH - v.y) / v.z;
 
-    // 1. PDF-Ausdrucke
     for (const e of this.doc.pdfs) {
       const lay = this.entryLayout(e);
       if (!lay) {
@@ -1357,7 +2182,6 @@ class InkView extends TextFileView {
       }
     }
 
-    // 2. Verknüpfte PDF-Anhang-Karten (v1.3)
     for (const lnk of (this.doc.links || [])) {
       const w = lnk.w || CARD_W;
       const h = this.linkHeight(lnk);
@@ -1365,7 +2189,6 @@ class InkView extends TextFileView {
       drawPdfLinkCard(ctx, lnk, v.z);
     }
 
-    // 3. Striche
     for (const s of this.doc.strokes) {
       const b = strokeBounds(s);
       if (b.x1 < vx0 || b.x0 > vx1 || b.y1 < vy0 || b.y0 > vy1) continue;
@@ -1404,7 +2227,7 @@ class InkView extends TextFileView {
     if (this.cur) paintStroke(ctx, this.cur, this.predicted);
 
     const sb = this.selBounds();
-    if (sb) {
+    if (sb && !(this.sel && this.sel.viewer)) {
       ctx.save();
       ctx.strokeStyle = "#4c8dff";
       ctx.lineWidth = 2 / v.z;
@@ -1429,7 +2252,7 @@ class InkView extends TextFileView {
     }
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (sb) {
+    if (sb && !(this.sel && this.sel.viewer)) {
       const pts = this.sel && (this.sel.entry || this.sel.link)
         ? [[sb.x1, sb.y1]]
         : [[sb.x0, sb.y0], [sb.x1, sb.y0], [sb.x0, sb.y1], [sb.x1, sb.y1]];
@@ -1457,65 +2280,225 @@ class InkView extends TextFileView {
     }
   }
 
-  /* ----- Eingabe & Multi-Layer S-Pen-Erkennung ----- */
+  /* ----- Eingabe & S-Pen-Seitentaste (v2.1.1: Halten = Radierer ohne Einfrieren, Loslassen = vorheriger Stift) ----- */
   bindEvents() {
     const c = this.canvas;
 
-    // 1. Native Android TouchEvent-Prüfung (Samsung S-Pen meldet Barrel-Button oft über touch.toolType === "eraser")
-    const checkAndroidTouchEraser = (te) => {
+    // 1. Native Android TouchEvent-Behandlung (passive: false!):
+    // - Erkennt Samsung S-Pen TOOL_TYPE_ERASER (toolType === 4 / "eraser").
+    // - WICHTIG (v2.1.1 Bugfix): Ruft bei aktivem S-Pen / gedrückter Seitentaste `te.preventDefault()` auf,
+    //   damit Android Chromium NICHT seinen internen `StylusTextSelector` / `GestureProvider` startet und
+    //   den Pointer-Stream beim Aufsetzen per `pointercancel` einfriert!
+    // - Falls Android WebView bei gehaltener Seitentaste dennoch keine `pointermove`-Events mehr sendet,
+    //   führt `handleTouch` den Radierer (bzw. das Verschieben) nahtlos über die Touch-Koordinaten weiter!
+    const handleTouch = (te) => {
       let foundEraser = false;
       const list = te.touches && te.touches.length ? te.touches : te.changedTouches || [];
       for (let i = 0; i < list.length; i++) {
         const t = list[i];
-        const tt = t.toolType || t.touchType || "";
-        if (tt === "eraser" || tt === 2 || tt === 3) {
+        const tt = t.toolType !== undefined ? t.toolType : "";
+        if (tt === "eraser" || tt === 4) {
           foundEraser = true;
           break;
         }
       }
       this.androidTouchEraser = foundEraser;
+      this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
+      const now = performance.now();
+      const isRecentPen = (now - this.lastPen) < 650;
+
       if (foundEraser) {
-        this.lastBarrelTime = performance.now();
-        this.switchActiveDrawToBarrel();
+        this.lastPen = now;
+        this.lastBarrelSignalTime = now;
+        this.hoverClearFrames = 0;
+        const p0 = list.length ? this.local(list[0]) : null;
+        this.setBarrelHeld(true, p0);
+      }
+
+      if (this.barrelHeld || foundEraser || this.contextMenuBarrel) {
+        if (te.cancelable) te.preventDefault();
+        if (list.length === 1 && this.plugin.settings.penButton !== "off") {
+          const t0 = list[0];
+          const p = this.local(t0);
+          const d = this.toDoc(p);
+          this.lastPen = now;
+          this.lastBarrelSignalTime = now;
+          this.hoverClearFrames = 0;
+          this.setBarrelHeld(true, p);
+
+          if (!this.active) {
+            this.startBarrelContactAction(1, p);
+          } else if (this.active.kind === "draw") {
+            this.switchActiveDrawToBarrel(p);
+          } else if (this.active.kind === "erase") {
+            this.eraseAtSegment(this.active.lastDoc || d, d, p);
+            this.active.lastDoc = d;
+          } else if (this.active.kind === "pan" && this.active.viaBarrel) {
+            const v = this.doc.view;
+            v.x += p.x - this.active.last.x;
+            v.y += p.y - this.active.last.y;
+            this.active.last = p;
+            this.invalidateStatic();
+          }
+          this.updateDebugHud(
+            { pointerType: "pen(touch)", buttons: 2, button: 0, pressure: t0.force || 0.5 },
+            this.plugin.settings.penButton
+          );
+        }
+      } else if (isRecentPen && te.cancelable) {
+        te.preventDefault();
       }
     };
-    c.addEventListener("touchstart", checkAndroidTouchEraser, { passive: true });
-    c.addEventListener("touchmove", checkAndroidTouchEraser, { passive: true });
-    c.addEventListener("touchend", () => { this.androidTouchEraser = false; }, { passive: true });
+    c.addEventListener("touchstart", handleTouch, { passive: false });
+    c.addEventListener("touchmove", handleTouch, { passive: false });
+    c.addEventListener("touchend", (te) => {
+      this.androidTouchEraser = false;
+      this.contextMenuBarrel = false;
+      this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
+      if (this.active && this.active.viaBarrel) {
+        this.finishBarrelAction();
+      }
+      if (!this.keyBarrelHeld) {
+        this.setBarrelHeld(false);
+      }
+    }, { passive: true });
+    c.addEventListener("touchcancel", () => {
+      this.androidTouchEraser = false;
+      this.contextMenuBarrel = false;
+      this.touchContactActive = false;
+      if (this.active && this.active.viaBarrel) {
+        this.finishBarrelAction();
+      }
+    }, { passive: true });
 
-    // 2. Contextmenu-Abfang (Samsung S-Pen mit gedrückter Taste feuert oft contextmenu beim Aufsetzen)
+    // 2. Contextmenu auf Canvas:
+    // - Auf dem Desktop (Maus-Rechtsklick) auf ein eingebettetes PDF/Anhang-Karte -> Kontextmenü zum PDF-Ändern/Öffnen
+    // - Beim S-Pen (oder direkt nach Pen-Kontakt): S-Pen-Seitentaste feuert auf Samsung OneUI oft contextmenu!
     c.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      // Wenn ein Stift aktiv oder in der Nähe ist, bedeutet contextmenu = S-Pen-Taste gedrückt!
-      if (e.pointerType === "pen" || performance.now() - this.lastPen < 600) {
-        this.lastBarrelTime = performance.now();
-        this.switchActiveDrawToBarrel(this.local(e));
+      const now = performance.now();
+      const isPenEvent = e.pointerType === "pen" || (now - this.lastPen < 650);
+
+      if (isPenEvent) {
+        // Nur als S-Pen-Seitentaste werten, wenn es beim Aufsetzen (< 350ms), bei bereits gehaltener Taste oder mit Barrel-Bit kam
+        // (nicht nach langem Stillhalten für die Formerkennung!)
+        const dtDown = now - this.lastPenDownTime;
+        if (this.barrelHeld || dtDown < 350 || (e.buttons & 2) || (e.buttons & 32) || e.button === 2) {
+          this.contextMenuBarrel = true;
+          this.lastBarrelSignalTime = now;
+          this.hoverClearFrames = 0;
+          const p = this.local(e);
+          this.setBarrelHeld(true, p);
+          if (this.active && this.active.kind === "draw") {
+            this.switchActiveDrawToBarrel(p);
+          } else if (!this.active && this.plugin.settings.penButton !== "off") {
+            this.startBarrelContactAction(e.pointerId || 1, p);
+          }
+        }
+        return;
+      }
+
+      // Maus-Rechtsklick auf ein PDF-Element auf der Leinwand -> Kontextmenü zum Ändern/Öffnen
+      const p = this.local(e);
+      const d = this.toDoc(p);
+      const hitLnk = this.hitLink(d);
+      const hitP = !hitLnk ? this.hitPdf(d) : null;
+      if (hitLnk || hitP) {
+        const target = hitLnk || hitP;
+        const targetType = hitLnk ? "link" : "entry";
+        this.sel = {
+          entry: hitP || null,
+          link: hitLnk || null,
+          viewer: null,
+          strokes: hitP ? this.strokesInEntry(hitP) : [],
+        };
+        this.refreshToolbar();
+        this.requestDraw();
+        const menu = new Menu();
+        menu.addItem((mi) =>
+          mi
+            .setTitle("Eingebettete PDF-Datei ändern …")
+            .setIcon("refresh-cw")
+            .onClick(() => this.changePdfFile(target, targetType))
+        );
+        menu.addItem((mi) =>
+          mi
+            .setTitle("PDF in neuem Tab öffnen")
+            .setIcon("external-link")
+            .onClick(() => this.openPdfLink(target))
+        );
+        menu.addSeparator();
+        menu.addItem((mi) =>
+          mi
+            .setTitle("Auswahl löschen")
+            .setIcon("trash-2")
+            .onClick(() => this.deleteSelection())
+        );
+        menu.showAtMouseEvent(e);
       }
     });
 
-    // 3. Bluetooth / Air-Action KeyEvent-Detektor (für S-Pen Pro / Air Actions)
+    // 3. KeyEvent-Detektor (falls Samsung/Android F20/F21/Eraser sendet)
     this._keyDownHandler = (ke) => {
       if (ke.key === "F20" || ke.key === "F21" || ke.code === "Eraser") {
         this.keyBarrelHeld = true;
-        this.lastBarrelTime = performance.now();
-        this.switchActiveDrawToBarrel();
+        this.lastBarrelSignalTime = performance.now();
+        this.hoverClearFrames = 0;
+        this.setBarrelHeld(true);
+        if (this.active && this.active.kind === "draw") {
+          this.switchActiveDrawToBarrel();
+        }
       }
     };
     this._keyUpHandler = (ke) => {
       if (ke.key === "F20" || ke.key === "F21" || ke.code === "Eraser") {
         this.keyBarrelHeld = false;
+        this.setBarrelHeld(false);
       }
     };
     window.addEventListener("keydown", this._keyDownHandler, true);
     window.addEventListener("keyup", this._keyUpHandler, true);
 
-    // 4. Reguläre PointerEvents
+    // 4. Low-Level pointerrawupdate (liefert auf Android-Tablets S-Pen-Bewegungen auch vor/trotz Gesten-Filterung)
+    c.addEventListener("pointerrawupdate", (e) => {
+      const isPen = e.pointerType === "pen" || this.androidTouchEraser;
+      if (!isPen) return;
+      this.lastPen = performance.now();
+      const p = this.local(e);
+      const penOverride = this.resolvePenAction(e, p);
+      if (penOverride) {
+        const d = this.toDoc(p);
+        this.updateDebugHud(e, penOverride);
+        if (!this.active) {
+          this.startBarrelContactAction(e.pointerId, p);
+        } else if (this.active.kind === "draw") {
+          this.switchActiveDrawToBarrel(p);
+        } else if (this.active.kind === "erase") {
+          this.eraseAtSegment(this.active.lastDoc || d, d, p);
+          this.active.lastDoc = d;
+        } else if (this.active.kind === "pan" && this.active.viaBarrel) {
+          const v = this.doc.view;
+          v.x += p.x - this.active.last.x;
+          v.y += p.y - this.active.last.y;
+          this.active.last = p;
+          this.invalidateStatic();
+        }
+      }
+    });
+
+    // 5. Reguläre PointerEvents
     c.addEventListener("pointerdown", (e) => this.onDown(e));
     c.addEventListener("pointermove", (e) => this.onMove(e));
     c.addEventListener("pointerup", (e) => this.onUp(e, false));
     c.addEventListener("pointercancel", (e) => this.onUp(e, true));
     c.addEventListener("pointerleave", () => {
+      this.androidTouchEraser = false;
+      this.keyBarrelHeld = false;
+      this.contextMenuBarrel = false;
+      this.touchContactActive = false;
+      this.hoverBtn1Frames = 0;
+      this.setBarrelHeld(false);
       if (this.eraserPos && !this.active) { this.eraserPos = null; this.requestDraw(); }
     });
     c.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
@@ -1523,34 +2506,93 @@ class InkView extends TextFileView {
     c.addEventListener("selectstart", (e) => e.preventDefault());
   }
 
-  /** Falls gerade ein Strich gezeichnet wird und Android nachträglich die S-Pen-Taste meldet, sofort umschalten! */
+  /**
+   * Aktiviert oder deaktiviert den temporären S-Pen-Seitentasten-Modus (Radierer/Pan).
+   * Beim Aktivieren leuchtet in der Toolbar sofort der Radierer auf; beim Loslassen
+   * wird wieder das vorherige Werkzeug (`this.tool`, z.B. Stift oder Textmarker) aktiviert.
+   */
+  setBarrelHeld(held, p) {
+    const next = Boolean(held && this.plugin.settings.penButton !== "off");
+    if (this.barrelHeld === next) {
+      if (next && p && this.plugin.settings.penButton === "eraser") {
+        this.eraserPos = p;
+        this.requestDraw();
+      }
+      return;
+    }
+    this.barrelHeld = next;
+    if (!next) {
+      this.contextMenuBarrel = false;
+      this.contactHasBarrelBit = false;
+      this.hoverBtn1Frames = 0;
+      if (this.active && this.active.viaBarrel) {
+        this.finishBarrelAction();
+      }
+      if (this.tool !== "eraser" && this.eraserPos) {
+        this.eraserPos = null;
+        this.requestDraw();
+      }
+    } else if (p && this.plugin.settings.penButton === "eraser") {
+      this.eraserPos = p;
+      this.requestDraw();
+    }
+    this.refreshToolbar();
+  }
+
+  finishBarrelAction() {
+    const a = this.active;
+    if (!a || !a.viaBarrel) return;
+    this.active = null;
+    if (!this.barrelHeld && this.tool !== "eraser") {
+      this.eraserPos = null;
+    }
+    if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
+    if (a.kind === "erase" && a.removed && a.removed.length) {
+      this.pushUndo({ t: "del", items: a.removed });
+      this.changed();
+    } else {
+      this.requestDraw();
+    }
+  }
+
+  startBarrelContactAction(pointerId, p) {
+    const st = this.plugin.settings;
+    if (st.penButton === "off") return;
+    const d = this.toDoc(p);
+    if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
+    if (st.penButton === "eraser") {
+      const prevRemoved = (this.active && this.active.kind === "erase") ? this.active.removed : [];
+      this.active = { id: pointerId, kind: "erase", pen: true, viaBarrel: true, removed: prevRemoved, lastDoc: d };
+      this.eraseAtSegment(d, d, p);
+    } else if (st.penButton === "pan") {
+      this.active = { id: pointerId, kind: "pan", pen: true, viaBarrel: true, last: p };
+    }
+  }
+
   switchActiveDrawToBarrel(fallbackPos) {
     const st = this.plugin.settings;
     if (st.penButton === "off") return;
-    if (!this.active || this.active.kind !== "draw") return;
+    const p = fallbackPos || this.eraserPos || this.holdAnchor || { x: 0, y: 0 };
+    const ptrId = this.active ? this.active.id : 1;
 
-    clearTimeout(this.holdTimer);
-    const p = fallbackPos || this.holdAnchor || { x: 0, y: 0 };
-    const d = this.toDoc(p);
-    const isTinyStart = (performance.now() - this.active.t0 < 240) ||
-      (this.cur && this.cur.points.length < 18);
+    if (this.active && this.active.kind === "draw") {
+      clearTimeout(this.holdTimer);
+      const isTinyStart = (performance.now() - this.active.t0 < 240) ||
+        (this.cur && this.cur.points.length < 18);
 
-    if (!isTinyStart && this.cur && this.cur.points.length > 1) {
-      this.doc.strokes.push(this.cur);
-      this.pushUndo({ t: "add", s: this.cur });
-      this.appendStrokeToStatic(this.cur);
-      this.requestSave();
+      if (!isTinyStart && this.cur && this.cur.points.length > 1) {
+        this.doc.strokes.push(this.cur);
+        this.pushUndo({ t: "add", s: this.cur });
+        this.appendStrokeToStatic(this.cur);
+        this.requestSave();
+      }
+      this.cur = null;
+      this.predicted = [];
+      this.snapped = null;
     }
-    this.cur = null;
-    this.predicted = [];
-    this.snapped = null;
 
-    if (st.penButton === "eraser") {
-      this.active = { id: this.active.id, kind: "erase", pen: true, removed: [], lastDoc: d };
-      this.eraseAtSegment(d, d, p);
-    } else if (st.penButton === "pan") {
-      this.active = { id: this.active.id, kind: "pan", pen: true, last: p };
-    }
+    this.setBarrelHeld(true, p);
+    this.startBarrelContactAction(ptrId, p);
   }
 
   local(e) {
@@ -1568,38 +2610,98 @@ class InkView extends TextFileView {
     return 0.5;
   }
 
-  /** Kombinierte S-Pen-Tasten-Erkennung aus PointerEvent, TouchEvent, Contextmenu & Hover-Gedächtnis. */
-  detectPenButtons(e) {
+  /**
+   * Prüft live bei jedem S-Pen-Event, ob die S-Pen-Seitentaste gedrückt gehalten oder losgelassen wurde (v2.1.1):
+   * - Explizite Barrel-Signale: Bit 2 (`buttons & 2`), Bit 4 (`buttons & 4`), Bit 32 (`buttons & 32`),
+   *   `button === 2`, `button === 5`, `androidTouchEraser` (`toolType === 4`), `keyBarrelHeld`.
+   * - Schweben mit gedrückter Seitentaste auf Galaxy Tab S9 FE: `pointermove`/`pointerrawupdate` mit
+   *   `e.pressure === 0 && e.buttons === 1` (mind. 2 Frames), ohne dass gerade normal gezeichnet wird.
+   * - Während des Display-Kontakts mit aktivem `barrelHeld` bleibt der Modus durchgehend erhalten
+   *   (kein 350ms/500ms-Ablauf-Bug beim Aufsetzen!).
+   * - Sobald die Taste losgelassen wird, wird `this.barrelHeld` sofort wieder auf `false` gesetzt
+   *   und auf den vorher benutzten Stift zurückgeschaltet.
+   */
+  updateBarrelState(e, p) {
     const isPen = e.pointerType === "pen" || this.androidTouchEraser;
-    if (!isPen) return { barrel: false, eraserEnd: false };
+    if (!isPen) return false;
+    if (this.plugin.settings.penButton === "off") {
+      if (this.barrelHeld) this.setBarrelHeld(false);
+      return false;
+    }
 
     const b = e.buttons || 0;
     const btn = e.button;
-    // Prüft Bitmasken 2 (Secondary/Barrel), 4 (Middle), 32 (Eraser) sowie button-Codes 1, 2, 5
-    const directBarrel = Boolean(
-      (b & 2) || (b & 4) || btn === 2 || btn === 1 ||
-      this.androidTouchEraser || this.keyBarrelHeld
-    );
-    const directEraser = Boolean((b & 32) || btn === 5 || this.androidTouchEraser);
+    const pr = e.pressure || 0;
+    const now = performance.now();
 
-    if (directBarrel || directEraser) {
-      this.lastBarrelTime = performance.now();
-      this.hoverZeroFrames = 0;
+    const explicitBit = Boolean(
+      (b & 2) ||
+      (b & 4) ||
+      (b & 32) ||
+      btn === 2 ||
+      btn === 5 ||
+      this.androidTouchEraser ||
+      this.keyBarrelHeld
+    );
+
+    const isMoveEv = e.type === "pointermove" || e.type === "pointerrawupdate";
+    const notNormalDraw = !this.active || this.active.viaBarrel;
+    if (isMoveEv && notNormalDraw && pr === 0 && b === 1 && !explicitBit) {
+      this.hoverBtn1Frames++;
+    } else if (pr === 0 && b === 0) {
+      this.hoverBtn1Frames = 0;
     }
-    // 320ms Zeitfenster überbrückt den kurzen Moment zwischen Hover-Ende und Spitzenkontakt auf Samsung-Displays
-    const recentHoverBarrel = (performance.now() - this.lastBarrelTime) < 320;
-    return {
-      barrel: directBarrel || recentHoverBarrel,
-      eraserEnd: directEraser,
-    };
+    const isHoverButton1 = this.hoverBtn1Frames >= 2;
+    const hasSignal = explicitBit || isHoverButton1 || this.contextMenuBarrel;
+
+    if (hasSignal) {
+      this.lastBarrelSignalTime = now;
+      this.hoverClearFrames = 0;
+      if (((b & 2) || (b & 4) || (b & 32)) && pr > 0) {
+        this.contactHasBarrelBit = true;
+      }
+      this.setBarrelHeld(true, p);
+      return true;
+    }
+
+    // Kein direktes Signal in diesem Frame:
+    // 1) Stift ist in der Luft ohne gedrückte Taste (pressure === 0 und buttons === 0) -> zurück zum normalen Stift!
+    if (pr === 0 && b === 0 && !this.touchContactActive) {
+      this.contextMenuBarrel = false;
+      this.hoverBtn1Frames = 0;
+      this.hoverClearFrames++;
+      if (this.hoverClearFrames >= 2 || now - this.lastBarrelSignalTime > 80) {
+        this.setBarrelHeld(false);
+      }
+      return this.barrelHeld;
+    }
+
+    // 2) Stift setzt gerade auf (pointerdown) oder bewegt sich auf dem Display, während barrelHeld bereits aktiv ist:
+    if (this.barrelHeld) {
+      // Falls das Gerät während des Display-Kontakts explizite Barrel-Bits (2/4/32) gesendet hat
+      // und diese jetzt während des Ziehens wegfallen (b === 1), wurde der Knopf während des Kontakts losgelassen!
+      if (isMoveEv && this.contactHasBarrelBit && b === 1 && pr > 0) {
+        this.hoverClearFrames++;
+        if (this.hoverClearFrames >= 2) {
+          this.setBarrelHeld(false);
+          return false;
+        }
+      } else {
+        this.hoverClearFrames = 0;
+      }
+      // Zeitstempel während des Kontakts frisch halten, damit der Barrel-Modus beim Aufsetzen/Ziehen niemals abläuft!
+      this.lastBarrelSignalTime = now;
+      this.setBarrelHeld(true, p);
+      return true;
+    }
+
+    return false;
   }
 
-  resolvePenAction(e) {
-    const st = this.plugin.settings;
-    const { barrel, eraserEnd } = this.detectPenButtons(e);
-    if (eraserEnd && st.penEraserEnd) return "eraser";
-    if ((barrel || eraserEnd) && st.penButton === "eraser") return "eraser";
-    if ((barrel || eraserEnd) && st.penButton === "pan") return "pan";
+  resolvePenAction(e, p) {
+    const mode = this.plugin.settings.penButton; // "eraser" | "pan" | "off"
+    if (mode === "off") return null;
+    if (this.updateBarrelState(e, p)) return mode;
     return null;
   }
 
@@ -1612,7 +2714,7 @@ class InkView extends TextFileView {
     this.debugHud.classList.add("is-visible");
     this.debugHud.textContent =
       `type=${e.pointerType} | buttons=${e.buttons} | button=${e.button} | ` +
-      `touchEraser=${this.androidTouchEraser ? "JA" : "nein"} | aktion=${action || "stift"}`;
+      `pressure=${r2(e.pressure || 0)} | sideBtn=${this.barrelHeld ? "GEHALTEN" : "losgelassen"} | tool=${action || this.tool}`;
   }
 
   penBusy() {
@@ -1630,6 +2732,7 @@ class InkView extends TextFileView {
     this.snapped = null;
     this.lasso = null;
     this.eraserPos = null;
+    if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
     this.requestDraw();
   }
 
@@ -1691,21 +2794,15 @@ class InkView extends TextFileView {
   }
 
   onDown(e) {
-    e.preventDefault();
+    const isPen = e.pointerType === "pen" || this.androidTouchEraser;
+    if (!isPen) e.preventDefault();
+
     const p = this.local(e);
     const d = this.toDoc(p);
-    try { this.canvas.setPointerCapture(e.pointerId); } catch (err) { /* */ }
-    const isPen = e.pointerType === "pen" || this.androidTouchEraser;
-
-    // Klick auf den "Öffnen ↗"-Button einer PDF-Anhang-Karte öffnet die PDF sofort (in jedem Modus außer Radierer)
-    const openBtnHit = this.hitLinkOpenButton(d);
-    if (openBtnHit && this.tool !== "eraser") {
-      this.openPdfLink(openBtnHit);
-      return;
-    }
 
     if (isPen) {
       this.lastPen = performance.now();
+      this.lastPenDownTime = this.lastPen;
       if (this.active && !this.active.pen) {
         this.cancelActive();
       }
@@ -1713,7 +2810,39 @@ class InkView extends TextFileView {
       this.multiTap = null;
     }
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser) {
+    const penOverride = isPen ? this.resolvePenAction(e, p) : null;
+    if (isPen) this.updateDebugHud(e, penOverride);
+
+    // WICHTIG (v2.1.1): PointerCapture niemals bei aktiver S-Pen-Seitentaste oder im Hover setzen,
+    // da Android Chromium sonst den Hover-Pointer sperrt und beim Aufsetzen der Spitze einfriert!
+    if (!isPen || (!penOverride && !this.barrelHeld && (e.pressure || 0) > 0)) {
+      try { this.canvas.setPointerCapture(e.pointerId); } catch (err) { /* */ }
+    } else {
+      try {
+        if (this.canvas.hasPointerCapture && this.canvas.hasPointerCapture(e.pointerId)) {
+          this.canvas.releasePointerCapture(e.pointerId);
+        }
+      } catch (err) { /* */ }
+    }
+
+    // Direkt-Buttons auf PDF-Anhang-Karten (nicht auslösen, wenn gerade radiert wird)
+    if (this.getEffectiveTool() !== "eraser") {
+      const changeBtnHit = this.hitLinkChangeButton(d);
+      if (changeBtnHit) {
+        this.sel = { entry: null, link: changeBtnHit, viewer: null, strokes: [] };
+        this.refreshToolbar();
+        this.requestDraw();
+        this.changePdfFile(changeBtnHit, "link");
+        return;
+      }
+      const openBtnHit = this.hitLinkOpenButton(d);
+      if (openBtnHit) {
+        this.openPdfLink(openBtnHit);
+        return;
+      }
+    }
+
+    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld) {
       if (this.penBusy()) return;
       this.touches.set(e.pointerId, p);
       const count = this.touches.size;
@@ -1732,7 +2861,28 @@ class InkView extends TextFileView {
       }
     }
 
-    if (this.active) return;
+    // Wenn die S-Pen-Seitentaste gedrückt ist (oder ein Touch-Event während aktivem barrelHeld eintrifft):
+    // Sofort die Barrel-Aktion (Radierer/Pan) starten bzw. fortsetzen – ohne Kontakt-Blockade!
+    if (penOverride || (this.barrelHeld && this.plugin.settings.penButton !== "off")) {
+      if (this.active && this.active.kind === "draw") {
+        this.switchActiveDrawToBarrel(p);
+      } else if (this.active && this.active.viaBarrel) {
+        this.active.id = e.pointerId;
+        if (this.active.kind === "erase") {
+          this.eraseAtSegment(this.active.lastDoc || d, d, p);
+          this.active.lastDoc = d;
+        } else if (this.active.kind === "pan") {
+          this.active.last = p;
+        }
+      } else {
+        this.startBarrelContactAction(e.pointerId, p);
+      }
+      return;
+    }
+
+    if (this.active) {
+      return;
+    }
 
     if (e.pointerType === "mouse" && e.button !== 0) {
       this.active = { id: e.pointerId, kind: "pan", last: p };
@@ -1740,24 +2890,15 @@ class InkView extends TextFileView {
     }
 
     let tool = this.tool;
-    const penOverride = isPen ? this.resolvePenAction(e) : null;
-    if (isPen) this.updateDebugHud(e, penOverride);
-
-    if (penOverride === "pan") {
-      this.active = { id: e.pointerId, kind: "pan", pen: true, last: p };
-      return;
-    }
-    if (penOverride === "eraser") {
-      tool = "eraser";
-    }
+    if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
 
     if (tool === "move" || tool === "lasso") {
-      // Doppelklick auf eine PDF-Anhang-Karte im Move/Lasso-Modus öffnet sie ebenfalls direkt
       const now = performance.now();
       const hitLnk = this.hitLink(d);
       if (hitLnk && now - this.lastTapTime < 350 && this.lastTapPos && Math.hypot(p.x - this.lastTapPos.x, p.y - this.lastTapPos.y) < 20) {
         this.openPdfLink(hitLnk);
         this.lastTapTime = 0;
+        if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
         return;
       }
       this.lastTapTime = now;
@@ -1776,18 +2917,18 @@ class InkView extends TextFileView {
       }
       if (tool === "move") {
         if (hitLnk) {
-          this.sel = { entry: null, link: hitLnk, strokes: [] };
-          this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: hitLnk, strokes: [], dx: 0, dy: 0 };
+          this.sel = { entry: null, link: hitLnk, viewer: null, strokes: [] };
+          this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: hitLnk, viewer: null, strokes: [], dx: 0, dy: 0 };
         } else {
           const hit = this.hitPdf(d);
           if (hit) {
-            this.sel = { entry: hit, link: null, strokes: this.strokesInEntry(hit) };
-            this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: hit, link: null, strokes: this.sel.strokes, dx: 0, dy: 0 };
+            this.sel = { entry: hit, link: null, viewer: null, strokes: this.strokesInEntry(hit) };
+            this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: hit, link: null, viewer: null, strokes: this.sel.strokes, dx: 0, dy: 0 };
           } else {
             const hitS = this.hitSingleStroke(d);
             if (hitS) {
-              this.sel = { entry: null, link: null, strokes: [hitS] };
-              this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: null, strokes: [hitS], dx: 0, dy: 0 };
+              this.sel = { entry: null, link: null, viewer: null, strokes: [hitS] };
+              this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: null, viewer: null, strokes: [hitS], dx: 0, dy: 0 };
             } else {
               this.sel = null;
               this.active = { id: e.pointerId, kind: "pan", pen: isPen, last: p };
@@ -1799,7 +2940,7 @@ class InkView extends TextFileView {
         if (b && d.x >= b.x0 && d.x <= b.x1 && d.y >= b.y0 && d.y <= b.y1) {
           this.active = {
             id: e.pointerId, kind: "drag", pen: isPen, last: d,
-            entry: this.sel.entry, link: this.sel.link, strokes: this.sel.strokes, dx: 0, dy: 0,
+            entry: this.sel.entry, link: this.sel.link, viewer: this.sel.viewer, strokes: this.sel.strokes, dx: 0, dy: 0,
           };
         } else {
           this.sel = null;
@@ -1808,12 +2949,20 @@ class InkView extends TextFileView {
         }
       }
       this.refreshToolbar();
+      this.updateViewersTransform();
       this.requestDraw();
       return;
     }
 
     if (tool === "eraser") {
-      this.active = { id: e.pointerId, kind: "erase", pen: isPen, removed: [], lastDoc: d };
+      this.active = {
+        id: e.pointerId,
+        kind: "erase",
+        pen: isPen,
+        viaBarrel: false,
+        removed: [],
+        lastDoc: d,
+      };
       this.eraseAtSegment(d, d, p);
       return;
     }
@@ -1841,49 +2990,64 @@ class InkView extends TextFileView {
     const p = this.local(e);
     const d = this.toDoc(p);
 
-    if (isPen) {
-      const hasBarrelBit = Boolean(
-        (e.buttons & 2) || (e.buttons & 4) || (e.buttons & 32) ||
-        e.button === 2 || e.button === 5 || this.androidTouchEraser || this.keyBarrelHeld
-      );
-      if (hasBarrelBit) {
-        this.lastBarrelTime = performance.now();
-        this.hoverZeroFrames = 0;
-      } else if (e.pressure === 0 && e.buttons === 0) {
-        this.hoverZeroFrames++;
-        if (this.hoverZeroFrames > 5) this.lastBarrelTime = 0;
-      }
+    if (isPen || (this.barrelHeld && this.plugin.settings.penButton !== "off")) {
+      const penOverride = isPen
+        ? this.resolvePenAction(e, p)
+        : (this.barrelHeld ? this.plugin.settings.penButton : null);
+      if (isPen) this.updateDebugHud(e, penOverride);
 
-      const penOverride = this.resolvePenAction(e);
-      this.updateDebugHud(e, penOverride);
-
-      if (!this.active) {
-        if (penOverride === "eraser" || this.tool === "eraser") {
-          this.eraserPos = p;
-          this.requestDraw();
-        } else if (this.eraserPos) {
-          this.eraserPos = null;
-          this.requestDraw();
-        }
-        if (e.pressure > 0 && penOverride === "eraser") {
-          this.active = { id: e.pointerId, kind: "erase", pen: true, removed: [], lastDoc: d };
-          this.eraseAtSegment(d, d, p);
+      if (penOverride) {
+        // S-Pen-Seitentaste ist gedrückt:
+        // - Falls zuvor ein Zeichenstrich lief -> sofort in Barrel-Radierer/Pan umwandeln!
+        // - Falls noch keine Aktion lief -> sofort Barrel-Radierer/Pan starten!
+        if (this.active && this.active.kind === "draw") {
+          this.switchActiveDrawToBarrel(p);
           return;
         }
-        if (e.pressure > 0 && penOverride === "pan") {
-          this.active = { id: e.pointerId, kind: "pan", pen: true, last: p };
+        if (!this.active) {
+          this.startBarrelContactAction(e.pointerId, p);
           return;
         }
-      }
+      } else {
+        // Seitentaste ist NICHT (mehr) gedrückt:
+        if (this.active && this.active.viaBarrel) {
+          this.finishBarrelAction();
+        }
+        if (!this.active) {
+          if (this.tool === "eraser") {
+            this.eraserPos = p;
+            this.requestDraw();
+          } else if (this.eraserPos) {
+            this.eraserPos = null;
+            this.requestDraw();
+          }
 
-      // Live-Umschaltung während der Stift zieht
-      if (this.active && this.active.id === e.pointerId && this.active.kind === "draw" && penOverride) {
-        this.switchActiveDrawToBarrel(p);
-        return;
+          // Falls die Seitentaste während des Kontakts auf dem Display losgelassen wurde:
+          // Sofort mit dem vorher benutzten Stift (this.tool) weiterschreiben!
+          if ((e.buttons & 1) && (e.pressure || 0) > 0 && (this.tool === "pen" || this.tool === "highlighter")) {
+            const pr = this.pressure(e);
+            if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
+            this.cur = {
+              tool: this.tool,
+              color: this.tool === "pen" ? this.penColor : this.hlColor,
+              width: this.width,
+              points: [[d.x, d.y, pr]],
+            };
+            this.predicted = [];
+            this.sm = { x: d.x, y: d.y, p: pr };
+            this.rawLast = { x: d.x, y: d.y, p: pr };
+            this.snapped = null;
+            this.holdAnchor = p;
+            this.active = { id: e.pointerId, kind: "draw", pen: true, t0: performance.now(), startScreen: p };
+            this.armHold();
+            this.requestDraw();
+            return;
+          }
+        }
       }
     }
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser && this.touches.has(e.pointerId)) {
+    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld && this.touches.has(e.pointerId)) {
       this.touches.set(e.pointerId, p);
       if (this.multiTap && !this.multiTap.moved) {
         const s0 = this.multiTap.startPts.get(e.pointerId);
@@ -1899,7 +3063,8 @@ class InkView extends TextFileView {
     }
 
     const a = this.active;
-    if (!a || a.id !== e.pointerId) return;
+    if (!a) return;
+    if (a.id !== e.pointerId && !a.viaBarrel) return;
     e.preventDefault();
     const v = this.doc.view;
 
@@ -1957,10 +3122,6 @@ class InkView extends TextFileView {
       }
       this.requestDraw();
     } else if (a.kind === "erase") {
-      if (isPen && e.pressure === 0 && e.buttons === 0 && !this.androidTouchEraser) {
-        this.onUp(e, false);
-        return;
-      }
       const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
       const list = evs.length ? evs : [e];
       for (const ev of list) {
@@ -1978,6 +3139,7 @@ class InkView extends TextFileView {
       const dx = d.x - a.last.x, dy = d.y - a.last.y;
       if (a.entry) { a.entry.x += dx; a.entry.y += dy; }
       if (a.link) { a.link.x += dx; a.link.y += dy; }
+      if (a.viewer) { a.viewer.x += dx; a.viewer.y += dy; this.updateViewersTransform(); }
       shiftStrokes(a.strokes, dx, dy);
       a.dx += dx; a.dy += dy;
       a.last = d;
@@ -2021,8 +3183,12 @@ class InkView extends TextFileView {
   }
 
   onUp(e, cancelled) {
-    if (e.pointerType === "pen") this.lastPen = performance.now();
-    if (e.pointerType === "touch") {
+    const isPen = e.pointerType === "pen" || this.androidTouchEraser;
+    if (isPen) {
+      this.lastPen = performance.now();
+    }
+
+    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld) {
       this.touches.delete(e.pointerId);
       this.gest = this.gestureState();
 
@@ -2043,12 +3209,42 @@ class InkView extends TextFileView {
       }
     }
 
+    // Falls Android wegen gedrückter S-Pen-Seitentaste (contextmenu / Stylus-Geste) ein künstliches pointercancel feuert:
+    // Den laufenden Barrel-Radierer NICHT abbrechen (auch ohne 500ms-Ablauf-Limit!), damit `touchmove` / `pointerrawupdate` / `pointermove`
+    // nahtlos weiterradieren können!
+    if (cancelled && (isPen || this.barrelHeld) && (this.barrelHeld || this.contextMenuBarrel)) {
+      if (this.active && this.active.kind === "draw") {
+        this.switchActiveDrawToBarrel(this.local(e));
+      } else if (!this.active && this.plugin.settings.penButton !== "off") {
+        this.startBarrelContactAction(e.pointerId || 1, this.local(e));
+      }
+      return;
+    }
+
+    if (isPen && !cancelled) {
+      this.androidTouchEraser = false;
+      this.keyBarrelHeld = false;
+      this.contextMenuBarrel = false;
+      this.touchContactActive = false;
+      this.hoverBtn1Frames = 0;
+      // Wenn beim Abheben/Loslassen keine Barrel-Bits mehr anliegen, sofort zurück zum vorherigen Stift!
+      const b = e.buttons || 0;
+      const stillHeld = Boolean((b & 2) || (b & 4) || (b & 32));
+      if (!stillHeld) {
+        this.setBarrelHeld(false);
+      }
+      this.updateDebugHud(e, this.barrelHeld ? this.plugin.settings.penButton : null);
+    }
+
     const a = this.active;
-    if (!a || a.id !== e.pointerId) return;
+    if (!a || (a.id !== e.pointerId && !a.viaBarrel)) return;
     clearTimeout(this.holdTimer);
     this.active = null;
-    this.eraserPos = null;
+    if (!this.barrelHeld && this.tool !== "eraser") {
+      this.eraserPos = null;
+    }
     this.predicted = [];
+    if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
 
     if (a.kind === "draw") {
       if (!this.snapped) this.catchUp();
@@ -2069,7 +3265,7 @@ class InkView extends TextFileView {
       }
     } else if (a.kind === "drag") {
       if (a.dx || a.dy) {
-        this.pushUndo({ t: "move", entry: a.entry, link: a.link, strokes: a.strokes, dx: a.dx, dy: a.dy });
+        this.pushUndo({ t: "move", entry: a.entry, link: a.link, viewer: a.viewer, strokes: a.strokes, dx: a.dx, dy: a.dy });
         this.changed();
       }
     } else if (a.kind === "scale") {
@@ -2090,17 +3286,18 @@ class InkView extends TextFileView {
       const d = this.toDoc(endScreen);
       const hitL = this.hitLink(d);
       if (hitL) {
-        this.sel = { entry: null, link: hitL, strokes: [] };
+        this.sel = { entry: null, link: hitL, viewer: null, strokes: [] };
       } else {
         const hitS = this.hitSingleStroke(d);
         if (hitS) {
-          this.sel = { entry: null, link: null, strokes: [hitS] };
+          this.sel = { entry: null, link: null, viewer: null, strokes: [hitS] };
         } else {
           const hitP = this.hitPdf(d);
-          if (hitP) this.sel = { entry: hitP, link: null, strokes: this.strokesInEntry(hitP) };
+          if (hitP) this.sel = { entry: hitP, link: null, viewer: null, strokes: this.strokesInEntry(hitP) };
         }
       }
       this.refreshToolbar();
+      this.updateViewersTransform();
       return;
     }
 
@@ -2120,9 +3317,10 @@ class InkView extends TextFileView {
         for (const q of s.points) if (pointInPoly(q[0], q[1], poly)) inside++;
         if (inside / s.points.length >= 0.5) picked.push(s);
       }
-      if (picked.length) this.sel = { entry: null, link: null, strokes: picked };
+      if (picked.length) this.sel = { entry: null, link: null, viewer: null, strokes: picked };
     }
     this.refreshToolbar();
+    this.updateViewersTransform();
   }
 
   eraseAtSegment(d0, d1, p) {
@@ -2197,6 +3395,28 @@ class InkView extends TextFileView {
         ctx.drawImage(tmp, e.x, e.y + p.y, e.w, p.h);
       }
     }
+    for (const vw of (this.doc.viewers || [])) {
+      const d = this.docs.get(vw.path);
+      const vwW = vw.w || VIEWER_W, vwH = vw.h || VIEWER_H;
+      ctx.fillStyle = "#f1f5f9";
+      ctx.fillRect(vw.x, vw.y, vwW, vwH);
+      if (d && d.pdf) {
+        const pgIdx = clamp(vw.page || 0, 0, d.asp.length - 1);
+        const pg = await d.pdf.getPage(pgIdx + 1);
+        const vp0 = pg.getViewport({ scale: 1 });
+        const vp = pg.getViewport({ scale: ((vwW - 24) * s) / vp0.width });
+        const tmp = document.createElement("canvas");
+        tmp.width = Math.max(1, Math.ceil(vp.width));
+        tmp.height = Math.max(1, Math.ceil(vp.height));
+        await pg.render({ canvasContext: tmp.getContext("2d"), canvas: tmp, viewport: vp }).promise;
+        const fullPageH = (vwW - 24) * (d.asp[pgIdx] || 1.414);
+        const drawH = Math.min(vwH - 52, fullPageH);
+        ctx.drawImage(tmp, 0, 0, tmp.width, tmp.height * (drawH / fullPageH), vw.x + 12, vw.y + 44, vwW - 24, drawH);
+      }
+      ctx.strokeStyle = "#cbd5e1";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(vw.x, vw.y, vwW, vwH);
+    }
     for (const lnk of (this.doc.links || [])) {
       drawPdfLinkCard(ctx, lnk, s);
     }
@@ -2225,6 +3445,23 @@ class InkSettingTab extends PluginSettingTab {
     const st = this.plugin.settings;
     containerEl.empty();
     new Setting(containerEl)
+      .setName("S-Pen-Seitentaste (gedrückt halten)")
+      .setDesc("Solange der seitliche Knopf am S Pen gedrückt gehalten wird, wird diese Aktion aktiviert; beim Loslassen wechselt das Plugin automatisch zurück zum vorher benutzten Stift.")
+      .addDropdown((d) => {
+        d.addOption("eraser", "Radierer (beim Loslassen zurück zum Stift)");
+        d.addOption("pan", "Leinwand verschieben");
+        d.addOption("off", "Deaktiviert (immer normal schreiben)");
+        d.setValue(st.penButton).onChange(async (v) => {
+          st.penButton = v; await this.plugin.saveSettings();
+        });
+      });
+    new Setting(containerEl)
+      .setName("Mit Finger zeichnen")
+      .setDesc("Aus: Finger verschiebt/zoomt die Leinwand, nur der S Pen schreibt (empfohlen auf dem Galaxy Tab).")
+      .addToggle((t) => t.setValue(st.fingerDraws).onChange(async (v) => {
+        st.fingerDraws = v; await this.plugin.saveSettings();
+      }));
+    new Setting(containerEl)
       .setName("Glättung der Handschrift")
       .setDesc("0 = rohe Eingabe, höher = ruhigere, glattere Linien.")
       .addSlider((s) => s.setLimits(0, 1, 0.05).setValue(st.smoothing).setDynamicTooltip().onChange(async (v) => {
@@ -2249,41 +3486,14 @@ class InkSettingTab extends PluginSettingTab {
         st.twoFingerUndo = v; await this.plugin.saveSettings();
       }));
     new Setting(containerEl)
-      .setName("Mit Finger zeichnen")
-      .setDesc("Aus: Finger verschiebt/zoomt die Leinwand, nur der S Pen schreibt (empfohlen auf dem Tablet).")
-      .addToggle((t) => t.setValue(st.fingerDraws).onChange(async (v) => {
-        st.fingerDraws = v; await this.plugin.saveSettings();
-      }));
-    new Setting(containerEl)
-      .setName("S-Pen-Taste (gedrückt halten)")
-      .setDesc("WICHTIG für Samsung-Tablets: Deaktiviere in den Android-Einstellungen unter 'Erweiterte Funktionen -> S Pen -> S-Pen-Befehle' die Option 'S-Pen-Befehle mit Stifttaste öffnen', damit Android die Taste nicht blockiert.")
-      .addDropdown((d) => {
-        d.addOption("eraser", "Radierer");
-        d.addOption("pan", "Leinwand verschieben");
-        d.addOption("off", "Keine Aktion");
-        d.setValue(st.penButton).onChange(async (v) => {
-          st.penButton = v; await this.plugin.saveSettings();
-        });
-      });
-    new Setting(containerEl)
-      .setName("Radierende des Stifts")
-      .setDesc("Falls dein Stift ein Radierende hat, radiert dieses automatisch.")
-      .addToggle((t) => t.setValue(st.penEraserEnd).onChange(async (v) => {
-        st.penEraserEnd = v; await this.plugin.saveSettings();
-      }));
-    new Setting(containerEl)
-      .setName("Live-Tasten-Diagnose (unten links)")
-      .setDesc("Zeigt unten links auf der Leinwand live alle Signale des S Pen an (Pointer, Touch-Eraser, Buttons).")
-      .addToggle((t) => t.setValue(st.penButtonDebug).onChange(async (v) => {
-        st.penButtonDebug = v; await this.plugin.saveSettings();
-      }));
-    new Setting(containerEl)
-      .setName("Eigene Farben zurücksetzen")
-      .setDesc("Löscht alle benutzerdefinierten Stift- und Textmarker-Farben aus der Werkzeugleiste.")
-      .addButton((b) => b.setButtonText("Zurücksetzen").onClick(async () => {
+      .setName("Eigene Farben (Fav-5-Stack) zurücksetzen")
+      .setDesc("Löscht alle gespeicherten eigenen Stift- und Textmarker-Farben.")
+      .addButton((b) => b.setButtonText("Alle löschen").onClick(async () => {
         st.customPenColors = [];
         st.customHlColors = [];
         await this.plugin.saveSettings();
+        const v = this.plugin.getActiveInk();
+        if (v) v.refreshToolbar();
         new Notice("Eigene Farben zurückgesetzt.");
       }));
     new Setting(containerEl)
@@ -2301,6 +3511,12 @@ class InkSettingTab extends PluginSettingTab {
       .addSlider((s) => s.setLimits(1, 3, 0.25).setValue(st.pdfQuality).setDynamicTooltip().onChange(async (v) => {
         st.pdfQuality = v; await this.plugin.saveSettings();
       }));
+    new Setting(containerEl)
+      .setName("Live-Tasten-Diagnose (unten links)")
+      .setDesc("Zeigt unten links auf der Leinwand live alle Signale des S Pen an.")
+      .addToggle((t) => t.setValue(st.penButtonDebug).onChange(async (v) => {
+        st.penButtonDebug = v; await this.plugin.saveSettings();
+      }));
   }
 }
 
@@ -2317,7 +3533,17 @@ class InkPlugin extends Plugin {
     this.addCommand({
       id: "new-note-from-pdf",
       name: "Neue Handschrift-Notiz aus PDF erstellen",
-      callback: () => this.pickPdf((f) => this.createNote(f)),
+      callback: () => this.pickPdf((f) => this.createNote(f, "printout")),
+    });
+    this.addCommand({
+      id: "insert-pdf-viewer",
+      name: "PDF als scrollbares Viewer-Fenster in Handschrift-Notiz einbetten",
+      checkCallback: (checking) => {
+        const v = this.getActiveInk();
+        if (!v) return false;
+        if (!checking) this.pickPdf((f) => v.addPdfViewer(f));
+        return true;
+      },
     });
     this.addCommand({
       id: "insert-pdf",
@@ -2336,6 +3562,26 @@ class InkPlugin extends Plugin {
         const v = this.getActiveInk();
         if (!v) return false;
         if (!checking) this.pickPdf((f) => v.addPdfLink(f));
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "change-embedded-pdf",
+      name: "Eingebettete PDF-Datei in Handschrift-Notiz ändern / austauschen",
+      checkCallback: (checking) => {
+        const v = this.getActiveInk();
+        if (!v) return false;
+        if (!checking) v.changeSelectedPdf();
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "toggle-eraser",
+      name: "Handschrift: Zwischen Stift und Radierer wechseln",
+      checkCallback: (checking) => {
+        const v = this.getActiveInk();
+        if (!v) return false;
+        if (!checking) v.setTool(v.tool === "eraser" ? "pen" : "eraser");
         return true;
       },
     });
@@ -2362,8 +3608,9 @@ class InkPlugin extends Plugin {
 
     this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
       if (file instanceof TFile && file.extension.toLowerCase() === "pdf") {
-        menu.addItem((i) => i.setTitle("Mit Handschrift beschriften (Ausdruck)").setIcon("pencil").onClick(() => this.createNote(file, false)));
-        menu.addItem((i) => i.setTitle("In neuer Handschrift-Notiz als Anhang verknüpfen").setIcon("paperclip").onClick(() => this.createNote(file, true)));
+        menu.addItem((i) => i.setTitle("In Handschrift-Notiz als Viewer-Fenster einbetten").setIcon("layout-panel-left").onClick(() => this.createNote(file, "viewer")));
+        menu.addItem((i) => i.setTitle("Mit Handschrift beschriften (Ausdruck)").setIcon("pencil").onClick(() => this.createNote(file, "printout")));
+        menu.addItem((i) => i.setTitle("In Handschrift-Notiz als Anhang verknüpfen").setIcon("paperclip").onClick(() => this.createNote(file, "link")));
       }
     }));
 
@@ -2375,13 +3622,11 @@ class InkPlugin extends Plugin {
     return v instanceof InkView ? v : null;
   }
 
-  pickPdf(cb) {
-    const pdfs = this.app.vault.getFiles().filter((f) => f.extension.toLowerCase() === "pdf");
-    if (!pdfs.length) { new Notice("Keine PDF-Dateien im Vault gefunden."); return; }
-    new PdfSuggestModal(this.app, cb).open();
+  pickPdf(cb, placeholder) {
+    new PdfSuggestModal(this.app, cb, placeholder).open();
   }
 
-  async createNote(pdfFile, asLink = false) {
+  async createNote(pdfFile, mode = "printout") {
     const active = this.app.workspace.getActiveFile();
     const folder = this.app.fileManager.getNewFileParent(active ? active.path : "");
     const dir = folder && folder.path && folder.path !== "/" ? folder.path + "/" : "";
@@ -2395,15 +3640,20 @@ class InkPlugin extends Plugin {
     const leaf = this.app.workspace.getLeaf(true);
     await leaf.openFile(file);
     if (pdfFile && leaf.view instanceof InkView) {
-      if (asLink) leaf.view.addPdfLink(pdfFile);
+      if (mode === "viewer") await leaf.view.addPdfViewer(pdfFile);
+      else if (mode === "link") leaf.view.addPdfLink(pdfFile);
       else await leaf.view.addPdf(pdfFile);
     }
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    delete this.settings.penEraserEnd;
     if (!Array.isArray(this.settings.customPenColors)) this.settings.customPenColors = [];
     if (!Array.isArray(this.settings.customHlColors)) this.settings.customHlColors = [];
+    this.settings.customPenColors = this.settings.customPenColors.slice(-MAX_CUSTOM_COLORS);
+    this.settings.customHlColors = this.settings.customHlColors.slice(-MAX_CUSTOM_COLORS);
   }
   async saveSettings() { await this.saveData(this.settings); }
 }
