@@ -8,7 +8,7 @@
   background: #ffffff;
 }
 
-/* Clean Tablet Toolbar v2.1.0 – Zentrierte Pill-Gruppen */
+/* Clean Tablet Toolbar v2.2.0 – Zentrierte Pill-Gruppen */
 .ink-toolbar,
 .is-mobile .ink-toolbar,
 .is-tablet .ink-toolbar,
@@ -357,6 +357,262 @@
   -webkit-user-select: none;
   -webkit-touch-callout: none;
   z-index: 5;
+}
+
+/* ---------- Textblöcke & Tabellen auf der Leinwand (v2.2.0) ---------- */
+.ink-texts-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.ink-texts-layer.is-drawing-active .ink-text-block:not(.is-focused) {
+  pointer-events: none !important;
+}
+
+.ink-text-block {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  border-radius: 10px;
+  border: 1.5px solid rgba(148, 163, 184, 0.55);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.08);
+  pointer-events: auto;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.ink-text-block.bg-transparent {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.ink-text-block.bg-transparent:hover,
+.ink-text-block.bg-transparent.is-selected,
+.ink-text-block.bg-transparent.is-focused {
+  border-color: rgba(76, 141, 255, 0.65);
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.ink-text-block.bg-note {
+  background: #fef9c3;
+  border-color: #eab308;
+  box-shadow: 0 6px 16px rgba(161, 98, 7, 0.12);
+}
+
+.ink-text-block.is-selected,
+.ink-text-block.is-focused {
+  border-color: #4c8dff;
+  box-shadow: 0 0 0 2px rgba(76, 141, 255, 0.25), 0 6px 18px rgba(15, 23, 42, 0.12);
+}
+
+.ink-text-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 6px;
+  background: rgba(241, 245, 249, 0.95);
+  border-bottom: 1px solid rgba(203, 213, 225, 0.7);
+  border-radius: 8px 8px 0 0;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.ink-text-block.bg-note .ink-text-header {
+  background: rgba(254, 240, 138, 0.95);
+  border-bottom-color: rgba(234, 179, 8, 0.45);
+}
+
+.ink-text-block:hover .ink-text-header,
+.ink-text-block.is-selected .ink-text-header,
+.ink-text-block.is-focused .ink-text-header,
+.ink-texts-layer.is-text-mode .ink-text-header {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ink-text-header:active {
+  cursor: grabbing;
+}
+
+.ink-text-drag-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #475569;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 2px;
+}
+
+.ink-view-content .ink-text-btn,
+.is-mobile .ink-view-content .ink-text-btn {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  height: 20px !important;
+  min-height: 20px !important;
+  padding: 0 5px !important;
+  border-radius: 5px !important;
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  color: #334155 !important;
+  background: rgba(255, 255, 255, 0.75) !important;
+  border: 1px solid rgba(148, 163, 184, 0.4) !important;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.ink-view-content .ink-text-btn:hover {
+  background: #ffffff !important;
+  color: #0f172a !important;
+}
+
+.ink-view-content .ink-text-btn.is-active {
+  background: #3b82f6 !important;
+  color: #ffffff !important;
+  border-color: #2563eb !important;
+}
+
+.ink-view-content .ink-text-btn.is-danger:hover {
+  background: #e03131 !important;
+  color: #ffffff !important;
+  border-color: #e03131 !important;
+}
+
+.ink-text-input,
+.is-mobile .ink-text-input {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px 10px;
+  margin: 0;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+  font-family: var(--font-text, sans-serif);
+  line-height: 1.4;
+  color: #111111;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  resize: none;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+  touch-action: manipulation;
+}
+
+.ink-text-input::placeholder {
+  color: rgba(100, 116, 139, 0.6);
+}
+
+/* Eingebettete Tabelle im Textblock */
+.ink-text-table-wrap {
+  padding: 4px 8px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ink-text-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.ink-text-table td,
+.ink-text-table th {
+  border: 1px solid #94a3b8;
+  padding: 0;
+  margin: 0;
+  vertical-align: top;
+}
+
+.ink-text-table tr:first-child td {
+  background: rgba(226, 232, 240, 0.75);
+  font-weight: 600;
+}
+
+.ink-text-cell-input,
+.is-mobile .ink-text-cell-input {
+  all: unset;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 6px;
+  font-family: var(--font-text, sans-serif);
+  font-size: inherit;
+  color: inherit;
+  line-height: 1.35;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ink-text-cell-input:focus {
+  background: rgba(59, 130, 246, 0.08) !important;
+}
+
+.ink-text-table-controls {
+  display: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.ink-text-block:hover .ink-text-table-controls,
+.ink-text-block.is-selected .ink-text-table-controls,
+.ink-text-block.is-focused .ink-text-table-controls {
+  display: flex;
+}
+
+.ink-text-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  background: linear-gradient(135deg, transparent 50%, #4c8dff 50%);
+  border-bottom-right-radius: 8px;
+  opacity: 0;
+  touch-action: none;
+  z-index: 4;
+  transition: opacity 0.12s ease;
+}
+
+.ink-text-block:hover .ink-text-resize,
+.ink-text-block.is-selected .ink-text-resize,
+.ink-text-block.is-focused .ink-text-resize {
+  opacity: 0.85;
 }
 
 /* ---------- Eingebettete PDF-Viewer-Fenster ---------- */

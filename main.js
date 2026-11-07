@@ -1,19 +1,22 @@
 "use strict";
 /*
- * Ink Canvas v2.1.1 – Handschrift-Notizen mit S Pen für Obsidian
- * Neu in v2.1.1 (Bugfix Release):
- * - S-Pen-Seitentaste Bugfix (Kein Einfrieren beim Aufsetzen auf das Display):
- *   1) Verhindert Androids `pointercancel` / `StylusTextSelector`-Unterbrechung beim Aufsetzen
- *      mit gehaltener Seitentaste durch aktive `touchstart`/`touchmove`-Behandlung (`passive: false`).
- *   2) Führt das Radieren (bzw. Verschieben) nahtlos über `pointermove`, `pointerrawupdate` UND
- *      `touchmove`-Fallback fort, sodass der Radierer beim Aufsetzen niemals einfriert.
- *   3) Entfernt die fehlerhafte `isPenTouchingDisplay`-Blockade und das 500ms-Timeout bei `pointercancel`.
- *   4) Schaltet beim Loslassen der Seitentaste sofort wieder auf den vorher benutzten Stift zurück.
- *
- * Neu in v2.1.0:
- * 1. Nachträgliches Ändern bereits eingebetteter PDF-Dateien (für alle Einbettungsarten:
- *    PDF-Viewer-Fenster, PDF-Seiten-Ausdruck & PDF-Anhang-Karte) inkl. Undo/Redo.
- * 2. S-Pen-Seitentaste (Halten = Radierer, Loslassen = vorheriger Stift).
+ * Ink Canvas v2.2.0 – Handschrift-Notizen mit S Pen für Obsidian
+ * Neu in v2.2.0:
+ * 1. Textblock- & Tabellen-Funktion (Tippen auf der Leinwand):
+ *    - Neues Werkzeug „Textblock“ (T-Icon in der Toolbar) zum Einfügen und Bearbeiten von Textfeldern
+ *      direkt auf der unendlichen Leinwand (per Tastatur auf Tablet & PC).
+ *    - Integrierte Tabellen-Funktion in jedem Textblock (Button „⊞ Tabelle“): Zeilen & Spalten direkt
+ *      im Textfeld einfügen und per Tastatur (inkl. Tab-Sprung von Zelle zu Zelle) ausfüllen.
+ *    - Anpassbare Schriftgröße (A- / A+), Fettdruck (B), Textfarbe (über die Farbpalette),
+ *      Hintergrund-Stil (Karte / Notizzettel / Transparent), freie Skalierung, Verschieben, Duplizieren,
+ *      PNG-Export sowie vollständiges Undo/Redo.
+ * 2. Ultra-flüssiger Radierer & S-Pen-Seitentaste (Performance- & Verbindungs-Upgrade):
+ *    - Kontinuierliche Segment-zu-Segment-Kollisionserkennung in Quadratdistanz (ohne teure Wurzel-Schleifen):
+ *      selbst schnelle Wischbewegungen erfassen jeden Strich lückenlos ohne Ruckler.
+ *    - Entkopplung des Statik-Canvas-Neuzeichnens von DOM-Transformationen (`invalidateStrokes`)
+ *      und Vermeidung dreifacher Event-Verarbeitung (`pointermove` vs. `pointerrawupdate` vs. `touchmove`).
+ *    - Nahtlose S-Pen-Verbindung beim schnellen Hin-und-Her-Radieren (Scrubbing-Haltefenster beim kurzen
+ *      Anheben der Stiftspitze, sofortige 1-Frame-Hover-Erkennung und rückwirkendes Pfad-Radieren).
  */
 const obsidian = require("obsidian");
 const {
@@ -29,8 +32,10 @@ const CARD_W = 320;
 const CARD_H = 76;
 const VIEWER_W = 520;
 const VIEWER_H = 680;
+const TEXT_W = 280;
+const TEXT_H = 84;
 const HL_MULT = 4;
-const ERASER_R = 16;
+const ERASER_R = 20;
 const HANDLE_R = 24;
 const MAX_CACHED_PAGES = 14;
 const MAX_CUSTOM_COLORS = 5;
@@ -38,6 +43,8 @@ const DEFAULT_PEN_COLORS = ["#111111", "#e03131", "#1971c2", "#2f9e44", "#f08c00
 const DEFAULT_HL_COLORS = ["#ffe14d", "#ff8fb1", "#7de08a", "#6cc8ff"];
 const BGS = ["grid", "lines", "dots", "none"];
 const BG_LABELS = { grid: "Karo", lines: "Linien", dots: "Punkte", none: "Blanko" };
+const TEXT_BG_STYLES = ["card", "note", "transparent"];
+const TEXT_BG_LABELS = { card: "Karte", note: "Notiz", transparent: "Transparent" };
 
 const DEFAULT_SETTINGS = {
   fingerDraws: false,
@@ -59,6 +66,7 @@ const r1 = (v) => Math.round(v * 10) / 10;
 const r2 = (v) => Math.round(v * 100) / 100;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const uid = () => Math.random().toString(36).slice(2, 10);
+const cloneTable = (tbl) => (Array.isArray(tbl) ? tbl.map((row) => (Array.isArray(row) ? row.map((c) => String(c || "")) : [])) : null);
 const newDoc = (bg) => ({
   v: 1,
   bg: bg || "grid",
@@ -67,6 +75,7 @@ const newDoc = (bg) => ({
   pdfs: [],
   links: [],
   viewers: [],
+  texts: [],
 });
 const widthMult = (s) => (s.tool === "highlighter" ? HL_MULT : 1);
 
@@ -84,28 +93,77 @@ function strokeBounds(s) {
   return s._b;
 }
 
-function distSeg(px, py, ax, ay, bx, by) {
+function distSegSq(px, py, ax, ay, bx, by) {
   const dx = bx - ax, dy = by - ay;
   const l2 = dx * dx + dy * dy;
   let t = l2 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
-  t = clamp(t, 0, 1);
-  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const rx = px - (ax + t * dx), ry = py - (ay + t * dy);
+  return rx * rx + ry * ry;
+}
+
+function distSeg(px, py, ax, ay, bx, by) {
+  return Math.sqrt(distSegSq(px, py, ax, ay, bx, by));
+}
+
+function orient2d(ax, ay, bx, by, cx, cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+  const o1 = orient2d(ax, ay, bx, by, cx, cy);
+  const o2 = orient2d(ax, ay, bx, by, dx, dy);
+  const o3 = orient2d(cx, cy, dx, dy, ax, ay);
+  const o4 = orient2d(cx, cy, dx, dy, bx, by);
+  return ((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) &&
+         ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0));
+}
+
+function segSegDistSq(ax, ay, bx, by, cx, cy, dx, dy) {
+  if (segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy)) return 0;
+  return Math.min(
+    distSegSq(ax, ay, cx, cy, dx, dy),
+    distSegSq(bx, by, cx, cy, dx, dy),
+    distSegSq(cx, cy, ax, ay, bx, by),
+    distSegSq(dx, dy, ax, ay, bx, by)
+  );
 }
 
 function strokeHit(s, x, y, r) {
   const pts = s.points;
-  if (pts.length === 1) return Math.hypot(x - pts[0][0], y - pts[0][1]) <= r;
+  const r2Val = r * r;
+  if (pts.length === 1) {
+    const dx = x - pts[0][0], dy = y - pts[0][1];
+    return dx * dx + dy * dy <= r2Val;
+  }
   for (let i = 1; i < pts.length; i++) {
-    if (distSeg(x, y, pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) <= r) return true;
+    const p0 = pts[i - 1], p1 = pts[i];
+    if (x + r < Math.min(p0[0], p1[0]) || x - r > Math.max(p0[0], p1[0]) ||
+        y + r < Math.min(p0[1], p1[1]) || y - r > Math.max(p0[1], p1[1])) continue;
+    if (distSegSq(x, y, p0[0], p0[1], p1[0], p1[1]) <= r2Val) return true;
   }
   return false;
 }
 
+/**
+ * v2.2.0: Exakte, kontinuierliche Segment-zu-Segment-Kollisionserkennung ohne Math.sqrt-Schleifen.
+ * Erfasst selbst sehr schnelle S-Pen-Radierbewegungen lückenlos und in einem Bruchteil der CPU-Zeit.
+ */
 function strokeHitSegment(s, x0, y0, x1, y1, r) {
-  const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(2, r * 0.6)));
-  for (let k = 0; k <= steps; k++) {
-    const t = k / steps;
-    if (strokeHit(s, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r)) return true;
+  if (x0 === x1 && y0 === y1) return strokeHit(s, x0, y0, r);
+  const pts = s.points;
+  const r2Val = r * r;
+  if (pts.length === 1) {
+    return distSegSq(pts[0][0], pts[0][1], x0, y0, x1, y1) <= r2Val;
+  }
+  const ex0 = Math.min(x0, x1) - r, ex1 = Math.max(x0, x1) + r;
+  const ey0 = Math.min(y0, y1) - r, ey1 = Math.max(y0, y1) + r;
+  for (let i = 1; i < pts.length; i++) {
+    const p0 = pts[i - 1], p1 = pts[i];
+    if (Math.max(p0[0], p1[0]) < ex0 || Math.min(p0[0], p1[0]) > ex1 ||
+        Math.max(p0[1], p1[1]) < ey0 || Math.min(p0[1], p1[1]) > ey1) continue;
+    if (segSegDistSq(x0, y0, x1, y1, p0[0], p0[1], p1[0], p1[1]) <= r2Val) return true;
   }
   return false;
 }
@@ -386,6 +444,85 @@ function drawPdfLinkCard(ctx, lnk, z) {
   ctx.restore();
 }
 
+/* ----- Textblock für PNG-Export auf Canvas zeichnen (inkl. Tabelle) ----- */
+function drawTextBlockOnCanvas(ctx, tb) {
+  const x = tb.x, y = tb.y;
+  const w = tb.w || TEXT_W;
+  const h = tb.h || TEXT_H;
+  const fs = tb.fontSize || 18;
+  const lineH = fs * 1.4;
+  const bgStyle = tb.bgStyle || "card";
+
+  ctx.save();
+  if (bgStyle !== "transparent") {
+    roundRectPath(ctx, x, y, w, h, 10);
+    ctx.fillStyle = bgStyle === "note" ? "#fef9c3" : "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = bgStyle === "note" ? "#eab308" : "#cbd5e1";
+    ctx.stroke();
+  }
+
+  let curY = y + 12 + fs;
+  const padX = 10;
+  const maxW = Math.max(40, w - padX * 2);
+
+  if (tb.text && tb.text.trim().length > 0) {
+    ctx.fillStyle = tb.color || "#111111";
+    ctx.font = `${tb.bold ? "700" : "400"} ${fs}px sans-serif`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    const paragraphs = String(tb.text).split("\n");
+    for (const para of paragraphs) {
+      const words = para.split(" ");
+      let line = "";
+      for (let i = 0; i < words.length; i++) {
+        const testLine = line ? line + " " + words[i] : words[i];
+        if (ctx.measureText(testLine).width > maxW && line) {
+          ctx.fillText(line, x + padX, curY);
+          line = words[i];
+          curY += lineH;
+        } else {
+          line = testLine;
+        }
+      }
+      ctx.fillText(line, x + padX, curY);
+      curY += lineH;
+    }
+  }
+
+  if (Array.isArray(tb.table) && tb.table.length > 0) {
+    const rows = tb.table.length;
+    const cols = Math.max(1, tb.table[0] ? tb.table[0].length : 1);
+    const cellW = maxW / cols;
+    const cellFs = Math.max(11, Math.round(fs * 0.85));
+    const rowH = Math.max(28, cellFs * 1.8);
+    let ty = (tb.text && tb.text.trim().length > 0) ? curY - fs + 8 : y + 12;
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cx = x + padX + c * cellW;
+        const cy = ty + r * rowH;
+        ctx.fillStyle = r === 0 ? "#e2e8f0" : "#ffffff";
+        ctx.fillRect(cx, cy, cellW, rowH);
+        ctx.strokeStyle = "#94a3b8";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(cx, cy, cellW, rowH);
+
+        const cellText = (tb.table[r] && tb.table[r][c]) ? String(tb.table[r][c]) : "";
+        if (cellText) {
+          ctx.fillStyle = tb.color || "#111111";
+          ctx.font = `${r === 0 || tb.bold ? "600" : "400"} ${cellFs}px sans-serif`;
+          ctx.textBaseline = "middle";
+          ctx.fillText(cellText, cx + 6, cy + rowH / 2, Math.max(10, cellW - 12));
+        }
+      }
+    }
+  }
+
+  ctx.restore();
+}
+
 /* ---------- Reines Vault-PDF-Auswahlfenster ---------- */
 class PdfSuggestModal extends FuzzySuggestModal {
   constructor(app, onChoose, placeholder) {
@@ -438,11 +575,15 @@ class InkView extends TextFileView {
     this.holdAnchor = null;
     this.eraserPos = null;
 
-    // S-Pen Seitentasten-Zustandsautomat (v2.1.1: Halten = Radierer ohne Einfrieren, Loslassen = vorheriger Stift)
+    // S-Pen Seitentasten-Zustandsautomat (v2.2.0: Ultra-flüssiger Radierer ohne Aussetzer)
     this.lastPen = 0;
     this.lastPenDownTime = 0;
+    this.lastPointerMoveTime = 0;
+    this.pointerCancelledBarrel = false;
     this.barrelHeld = false;
     this.lastBarrelSignalTime = 0;
+    this.lastBarrelLiftTime = 0;
+    this.barrelReleaseTimer = null;
     this.hoverClearFrames = 0;
     this.hoverBtn1Frames = 0;
     this.contactHasBarrelBit = false;
@@ -453,8 +594,9 @@ class InkView extends TextFileView {
     this.lastTapTime = 0;
     this.lastTapPos = null;
 
-    // Eingebettete PDF-Viewer DOM-Instanzen
+    // Eingebettete PDF-Viewer & Textblöcke DOM-Instanzen
     this.viewerDom = new Map();
+    this.textDom = new Map();
 
     // Rendering & Offscreen-Cache
     this.cssW = 0; this.cssH = 0; this.dpr = 1;
@@ -477,10 +619,12 @@ class InkView extends TextFileView {
 
   async onClose() {
     clearTimeout(this.holdTimer);
+    clearTimeout(this.barrelReleaseTimer);
     if (this.ro) this.ro.disconnect();
     if (this._keyDownHandler) window.removeEventListener("keydown", this._keyDownHandler, true);
     if (this._keyUpHandler) window.removeEventListener("keyup", this._keyUpHandler, true);
     if (this._outsideClickHandler) window.removeEventListener("pointerdown", this._outsideClickHandler, true);
+    this.destroyTextDoms();
     this.destroyViewerDoms();
     this.destroyPdfs();
   }
@@ -489,6 +633,7 @@ class InkView extends TextFileView {
   getViewData() { return this.serialize(); }
   setViewData(data) { this.loadData(data); }
   clear() {
+    this.destroyTextDoms();
     this.destroyViewerDoms();
     this.destroyPdfs();
     this.doc = newDoc(this.plugin.settings.background);
@@ -533,6 +678,24 @@ class InkView extends TextFileView {
         page: vw.page || 0,
       }));
     }
+    if (d.texts && d.texts.length) {
+      out.texts = d.texts.map((tb) => {
+        const o = {
+          id: tb.id,
+          x: r1(tb.x),
+          y: r1(tb.y),
+          w: r1(tb.w || TEXT_W),
+          h: r1(tb.h || TEXT_H),
+          text: tb.text || "",
+          color: tb.color || "#111111",
+          fontSize: r1(tb.fontSize || 18),
+          bgStyle: tb.bgStyle || "card",
+        };
+        if (tb.bold) o.bold = true;
+        if (Array.isArray(tb.table) && tb.table.length) o.table = cloneTable(tb.table);
+        return o;
+      });
+    }
     return JSON.stringify(out);
   }
 
@@ -567,7 +730,21 @@ class InkView extends TextFileView {
         h: vw.h || VIEWER_H,
         page: Number.isInteger(vw.page) ? vw.page : 0,
       }));
+      d.texts = (j.texts || []).map((tb) => ({
+        id: tb.id || uid(),
+        x: tb.x || 0,
+        y: tb.y || 0,
+        w: tb.w || TEXT_W,
+        h: tb.h || TEXT_H,
+        text: typeof tb.text === "string" ? tb.text : "",
+        color: tb.color || "#111111",
+        fontSize: tb.fontSize || 18,
+        bgStyle: TEXT_BG_STYLES.includes(tb.bgStyle) ? tb.bgStyle : "card",
+        bold: !!tb.bold,
+        table: Array.isArray(tb.table) && tb.table.length ? cloneTable(tb.table) : null,
+      }));
     }
+    this.destroyTextDoms();
     this.destroyViewerDoms();
     this.destroyPdfs();
     this.doc = d;
@@ -579,6 +756,7 @@ class InkView extends TextFileView {
       this.ensureDoc(vw.path).then(() => this.syncViewerDoms()).catch(() => {});
     }
     this.syncViewerDoms();
+    this.syncTextDoms();
     this.invalidateStatic();
   }
 
@@ -598,6 +776,542 @@ class InkView extends TextFileView {
       try { item.el.remove(); } catch (e) { /* */ }
     }
     this.viewerDom.clear();
+  }
+
+  destroyTextDoms() {
+    for (const item of this.textDom.values()) {
+      try { item.el.remove(); } catch (e) { /* */ }
+    }
+    this.textDom.clear();
+  }
+
+  /* ----- Textblöcke & Tabellen auf der Leinwand (v2.2.0) ----- */
+  addTextBlock(docX, docY, withTable = false) {
+    const d = this.doc;
+    const v = d.view;
+    const x = docX != null ? Math.round(docX) : Math.round((this.cssW / 2 - v.x) / v.z - TEXT_W / 2);
+    const y = docY != null ? Math.round(docY) : Math.round((this.cssH / 2 - v.y) / v.z - TEXT_H / 2);
+    const tb = {
+      id: uid(),
+      x,
+      y,
+      w: withTable ? 340 : TEXT_W,
+      h: withTable ? 130 : TEXT_H,
+      text: "",
+      color: this.penColor || "#111111",
+      fontSize: 18,
+      bgStyle: "card",
+      bold: false,
+      table: withTable ? [["Spalte 1", "Spalte 2"], ["", ""]] : null,
+    };
+    if (!d.texts) d.texts = [];
+    d.texts.push(tb);
+    this.pushUndo({ t: "textadd", textBlock: tb });
+    this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+    this.syncTextDoms();
+    this.changed();
+    setTimeout(() => this.focusTextDom(tb.id, withTable), 20);
+    return tb;
+  }
+
+  focusTextDom(id, focusTableFirst = false) {
+    const item = this.textDom.get(id);
+    if (!item) return;
+    if (focusTableFirst && item.firstCellInput) {
+      item.firstCellInput.focus();
+      return;
+    }
+    if (item.inputEl) {
+      item.inputEl.focus();
+      const len = item.inputEl.value.length;
+      try { item.inputEl.setSelectionRange(len, len); } catch (e) { /* */ }
+    }
+  }
+
+  blurAllTexts() {
+    for (const item of this.textDom.values()) {
+      if (item.el.classList.contains("is-focused")) {
+        const activeEl = document.activeElement;
+        if (activeEl && item.el.contains(activeEl) && typeof activeEl.blur === "function") {
+          activeEl.blur();
+        }
+        item.el.classList.remove("is-focused");
+      }
+    }
+  }
+
+  syncTextDoms() {
+    if (!this.textsLayer) return;
+    const texts = this.doc.texts || [];
+    const activeIds = new Set(texts.map((t) => t.id));
+
+    for (const [id, item] of this.textDom.entries()) {
+      if (!activeIds.has(id)) {
+        try { item.el.remove(); } catch (e) { /* */ }
+        this.textDom.delete(id);
+      }
+    }
+
+    for (const tb of texts) {
+      let item = this.textDom.get(tb.id);
+      if (!item) {
+        item = this.createTextDom(tb);
+        this.textDom.set(tb.id, item);
+      } else {
+        this.refreshTextDomContent(tb, item);
+      }
+    }
+    this.updateTextsTransform();
+  }
+
+  createTextDom(tb) {
+    const el = this.textsLayer.createDiv({ cls: "ink-text-block" });
+    const header = el.createDiv({ cls: "ink-text-header" });
+    header.createSpan({ cls: "ink-text-drag-label", text: "⋮⋮ Text" });
+
+    const btnFontDec = header.createEl("button", {
+      cls: "ink-text-btn",
+      text: "A-",
+      attr: { title: "Schrift verkleinern" },
+    });
+    const btnFontInc = header.createEl("button", {
+      cls: "ink-text-btn",
+      text: "A+",
+      attr: { title: "Schrift vergrößern" },
+    });
+    const btnBold = header.createEl("button", {
+      cls: "ink-text-btn" + (tb.bold ? " is-active" : ""),
+      text: "B",
+      attr: { title: "Fettdruck umschalten" },
+    });
+    const btnBg = header.createEl("button", {
+      cls: "ink-text-btn",
+      text: TEXT_BG_LABELS[tb.bgStyle || "card"],
+      attr: { title: "Hintergrund wechseln (Karte / Notiz / Transparent)" },
+    });
+    const btnTable = header.createEl("button", {
+      cls: "ink-text-btn" + (tb.table ? " is-active" : ""),
+      text: "⊞ Tabelle",
+      attr: { title: "Tabelle im Textblock einfügen oder ausblenden" },
+    });
+    const btnDel = header.createEl("button", {
+      cls: "ink-text-btn is-danger",
+      text: "✕",
+      attr: { title: "Textblock löschen" },
+    });
+
+    const inputEl = el.createEl("textarea", {
+      cls: "ink-text-input",
+      attr: { placeholder: "Tippen …", rows: "1" },
+    });
+    inputEl.value = tb.text || "";
+
+    const tableWrap = el.createDiv({ cls: "ink-text-table-wrap is-hidden" });
+    const resizeEl = el.createDiv({ cls: "ink-text-resize", attr: { title: "Breite anpassen" } });
+
+    const item = {
+      el,
+      header,
+      inputEl,
+      tableWrap,
+      btnBold,
+      btnBg,
+      btnTable,
+      firstCellInput: null,
+      lastCommittedText: tb.text || "",
+      lastCommittedTable: cloneTable(tb.table),
+    };
+
+    const stopProp = (ev) => ev.stopPropagation();
+    for (const b of [btnFontDec, btnFontInc, btnBold, btnBg, btnTable, btnDel]) {
+      b.addEventListener("pointerdown", stopProp);
+      b.addEventListener("touchstart", stopProp, { passive: true });
+    }
+
+    const autoSize = () => {
+      inputEl.style.height = "auto";
+      inputEl.style.height = Math.max(40, inputEl.scrollHeight) + "px";
+      tb.h = Math.max(TEXT_H, Math.round(el.offsetHeight || TEXT_H));
+    };
+
+    btnFontDec.addEventListener("click", () => {
+      const oldFs = tb.fontSize || 18;
+      tb.fontSize = clamp(oldFs - 2, 10, 72);
+      if (tb.fontSize !== oldFs) {
+        this.pushUndo({ t: "textstyle", textBlock: tb, prop: "fontSize", oldVal: oldFs, newVal: tb.fontSize });
+        this.refreshTextDomContent(tb, item);
+        this.changed();
+      }
+    });
+
+    btnFontInc.addEventListener("click", () => {
+      const oldFs = tb.fontSize || 18;
+      tb.fontSize = clamp(oldFs + 2, 10, 72);
+      if (tb.fontSize !== oldFs) {
+        this.pushUndo({ t: "textstyle", textBlock: tb, prop: "fontSize", oldVal: oldFs, newVal: tb.fontSize });
+        this.refreshTextDomContent(tb, item);
+        this.changed();
+      }
+    });
+
+    btnBold.addEventListener("click", () => {
+      const oldVal = !!tb.bold;
+      tb.bold = !oldVal;
+      this.pushUndo({ t: "textstyle", textBlock: tb, prop: "bold", oldVal, newVal: tb.bold });
+      this.refreshTextDomContent(tb, item);
+      this.changed();
+    });
+
+    btnBg.addEventListener("click", () => {
+      const oldVal = tb.bgStyle || "card";
+      const idx = TEXT_BG_STYLES.indexOf(oldVal);
+      tb.bgStyle = TEXT_BG_STYLES[(idx + 1) % TEXT_BG_STYLES.length];
+      this.pushUndo({ t: "textstyle", textBlock: tb, prop: "bgStyle", oldVal, newVal: tb.bgStyle });
+      this.refreshTextDomContent(tb, item);
+      this.changed();
+    });
+
+    btnTable.addEventListener("click", () => {
+      const oldTbl = cloneTable(tb.table);
+      if (!tb.table) {
+        tb.table = [["Spalte 1", "Spalte 2"], ["", ""]];
+        if ((tb.w || TEXT_W) < 320) tb.w = 340;
+      } else {
+        tb.table = null;
+      }
+      const newTbl = cloneTable(tb.table);
+      item.lastCommittedTable = cloneTable(tb.table);
+      this.pushUndo({ t: "texttable", textBlock: tb, oldTable: oldTbl, newTable: newTbl });
+      this.refreshTextDomContent(tb, item);
+      this.updateTextsTransform();
+      this.changed();
+      if (tb.table) setTimeout(() => this.focusTextDom(tb.id, true), 20);
+    });
+
+    btnDel.addEventListener("click", () => {
+      this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+      this.deleteSelection();
+    });
+
+    // Eingabefeld-Ereignisse
+    inputEl.addEventListener("pointerdown", (ev) => {
+      ev.stopPropagation();
+      this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+      this.refreshToolbar();
+      this.updateTextsTransform();
+      this.requestDraw();
+    });
+    inputEl.addEventListener("touchstart", (ev) => ev.stopPropagation(), { passive: true });
+    inputEl.addEventListener("focus", () => {
+      el.classList.add("is-focused");
+      this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+      item.lastCommittedText = tb.text || "";
+      this.refreshToolbar();
+      this.updateTextsTransform();
+    });
+    inputEl.addEventListener("blur", () => {
+      setTimeout(() => {
+        if (!el.contains(document.activeElement)) {
+          el.classList.remove("is-focused");
+        }
+      }, 60);
+      if (tb.text !== item.lastCommittedText) {
+        this.pushUndo({
+          t: "textedit",
+          textBlock: tb,
+          oldText: item.lastCommittedText,
+          newText: tb.text,
+        });
+        item.lastCommittedText = tb.text;
+        this.changed();
+      }
+    });
+    inputEl.addEventListener("input", () => {
+      tb.text = inputEl.value;
+      autoSize();
+      this.requestSave();
+    });
+    inputEl.addEventListener("keydown", (ke) => {
+      ke.stopPropagation();
+      if (ke.key === "Tab") {
+        ke.preventDefault();
+        const s = inputEl.selectionStart || 0;
+        const e = inputEl.selectionEnd || 0;
+        inputEl.value = inputEl.value.slice(0, s) + "  " + inputEl.value.slice(e);
+        inputEl.selectionStart = inputEl.selectionEnd = s + 2;
+        tb.text = inputEl.value;
+        autoSize();
+        this.requestSave();
+      } else if (ke.key === "Escape") {
+        inputEl.blur();
+      }
+    });
+
+    // Ziehen über die Kopfzeile (oder den gesamten Block im Bewegen-Modus)
+    const startDrag = (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      try { header.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
+      this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+      this.refreshToolbar();
+      this.updateTextsTransform();
+      let lastDoc = this.toDoc(this.local(ev));
+      let totalDx = 0, totalDy = 0;
+
+      const onMove = (me) => {
+        if (me.pointerId !== ev.pointerId) return;
+        const curDoc = this.toDoc(this.local(me));
+        const dx = curDoc.x - lastDoc.x, dy = curDoc.y - lastDoc.y;
+        tb.x += dx; tb.y += dy;
+        totalDx += dx; totalDy += dy;
+        lastDoc = curDoc;
+        this.updateTextsTransform();
+        this.requestDraw();
+      };
+      const onUp = (ue) => {
+        if (ue.pointerId !== ev.pointerId) return;
+        header.removeEventListener("pointermove", onMove);
+        header.removeEventListener("pointerup", onUp);
+        header.removeEventListener("pointercancel", onUp);
+        if (Math.abs(totalDx) > 0.5 || Math.abs(totalDy) > 0.5) {
+          this.pushUndo({ t: "move", entry: null, link: null, viewer: null, text: tb, strokes: [], dx: totalDx, dy: totalDy });
+          this.changed();
+        }
+      };
+      header.addEventListener("pointermove", onMove);
+      header.addEventListener("pointerup", onUp);
+      header.addEventListener("pointercancel", onUp);
+    };
+    header.addEventListener("pointerdown", startDrag);
+
+    // Skalieren/Breite anpassen über die Ecke unten rechts
+    resizeEl.addEventListener("pointerdown", (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      try { resizeEl.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
+      this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+      this.refreshToolbar();
+      const startDoc = this.toDoc(this.local(ev));
+      const w0 = tb.w || TEXT_W;
+
+      const onMove = (me) => {
+        if (me.pointerId !== ev.pointerId) return;
+        const curDoc = this.toDoc(this.local(me));
+        tb.w = clamp(Math.round(w0 + (curDoc.x - startDoc.x)), 120, 1600);
+        autoSize();
+        this.updateTextsTransform();
+        this.requestDraw();
+      };
+      const onUp = (ue) => {
+        if (ue.pointerId !== ev.pointerId) return;
+        resizeEl.removeEventListener("pointermove", onMove);
+        resizeEl.removeEventListener("pointerup", onUp);
+        resizeEl.removeEventListener("pointercancel", onUp);
+        if (tb.w !== w0) {
+          this.pushUndo({ t: "textresize", textBlock: tb, w0, w1: tb.w });
+          this.changed();
+        }
+      };
+      resizeEl.addEventListener("pointermove", onMove);
+      resizeEl.addEventListener("pointerup", onUp);
+      resizeEl.addEventListener("pointercancel", onUp);
+    });
+
+    this.refreshTextDomContent(tb, item);
+    setTimeout(autoSize, 0);
+    return item;
+  }
+
+  refreshTextDomContent(tb, item) {
+    const { el, inputEl, btnBold, btnBg, btnTable } = item;
+    const bgStyle = tb.bgStyle || "card";
+    el.classList.toggle("bg-transparent", bgStyle === "transparent");
+    el.classList.toggle("bg-note", bgStyle === "note");
+    btnBold.classList.toggle("is-active", !!tb.bold);
+    btnBg.textContent = TEXT_BG_LABELS[bgStyle] || "Karte";
+    btnTable.classList.toggle("is-active", Boolean(tb.table && tb.table.length));
+
+    if (document.activeElement !== inputEl && inputEl.value !== (tb.text || "")) {
+      inputEl.value = tb.text || "";
+      item.lastCommittedText = tb.text || "";
+    }
+    inputEl.style.color = tb.color || "#111111";
+    inputEl.style.fontSize = (tb.fontSize || 18) + "px";
+    inputEl.style.fontWeight = tb.bold ? "700" : "400";
+    inputEl.style.height = "auto";
+    inputEl.style.height = Math.max(40, inputEl.scrollHeight) + "px";
+
+    this.renderTextTableDom(tb, item);
+    tb.h = Math.max(TEXT_H, Math.round(el.offsetHeight || TEXT_H));
+  }
+
+  renderTextTableDom(tb, item) {
+    const { tableWrap, el } = item;
+    tableWrap.empty();
+    item.firstCellInput = null;
+
+    if (!Array.isArray(tb.table) || !tb.table.length) {
+      tableWrap.classList.add("is-hidden");
+      return;
+    }
+    tableWrap.classList.remove("is-hidden");
+
+    const tableEl = tableWrap.createEl("table", { cls: "ink-text-table" });
+    tableEl.style.color = tb.color || "#111111";
+    tableEl.style.fontSize = Math.max(12, Math.round((tb.fontSize || 18) * 0.86)) + "px";
+
+    const cellInputs = [];
+    const rows = tb.table.length;
+    const cols = Math.max(1, tb.table[0] ? tb.table[0].length : 1);
+
+    const commitTableUndoIfChanged = () => {
+      const prevJson = JSON.stringify(item.lastCommittedTable);
+      const curJson = JSON.stringify(tb.table);
+      if (prevJson !== curJson) {
+        this.pushUndo({
+          t: "texttable",
+          textBlock: tb,
+          oldTable: cloneTable(item.lastCommittedTable),
+          newTable: cloneTable(tb.table),
+        });
+        item.lastCommittedTable = cloneTable(tb.table);
+        this.changed();
+      }
+    };
+
+    for (let r = 0; r < rows; r++) {
+      const tr = tableEl.createEl("tr");
+      if (!Array.isArray(tb.table[r])) tb.table[r] = [];
+      for (let c = 0; c < cols; c++) {
+        const td = tr.createEl("td");
+        const inp = td.createEl("input", {
+          cls: "ink-text-cell-input",
+          attr: { type: "text", placeholder: r === 0 ? `Spalte ${c + 1}` : "…" },
+        });
+        inp.value = tb.table[r][c] || "";
+        if (!item.firstCellInput) item.firstCellInput = inp;
+        cellInputs.push(inp);
+
+        inp.addEventListener("pointerdown", (ev) => {
+          ev.stopPropagation();
+          this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+          this.refreshToolbar();
+          this.updateTextsTransform();
+        });
+        inp.addEventListener("touchstart", (ev) => ev.stopPropagation(), { passive: true });
+        inp.addEventListener("focus", () => {
+          el.classList.add("is-focused");
+          item.lastCommittedTable = cloneTable(tb.table);
+          this.sel = { entry: null, link: null, viewer: null, text: tb, strokes: [] };
+          this.refreshToolbar();
+          this.updateTextsTransform();
+        });
+        inp.addEventListener("blur", () => {
+          setTimeout(() => {
+            if (!el.contains(document.activeElement)) el.classList.remove("is-focused");
+          }, 60);
+          commitTableUndoIfChanged();
+        });
+        inp.addEventListener("input", () => {
+          tb.table[r][c] = inp.value;
+          this.requestSave();
+        });
+        inp.addEventListener("keydown", (ke) => {
+          ke.stopPropagation();
+          const idx = cellInputs.indexOf(inp);
+          if (ke.key === "Tab") {
+            ke.preventDefault();
+            const nextIdx = ke.shiftKey ? idx - 1 : idx + 1;
+            if (nextIdx >= 0 && nextIdx < cellInputs.length) {
+              cellInputs[nextIdx].focus();
+            } else if (!ke.shiftKey && nextIdx >= cellInputs.length) {
+              // Am Tabellenende erzeugt Tab direkt eine neue Zeile
+              const oldTbl = cloneTable(tb.table);
+              tb.table.push(new Array(cols).fill(""));
+              item.lastCommittedTable = cloneTable(tb.table);
+              this.pushUndo({ t: "texttable", textBlock: tb, oldTable: oldTbl, newTable: cloneTable(tb.table) });
+              this.renderTextTableDom(tb, item);
+              this.changed();
+              const allNew = tableWrap.querySelectorAll(".ink-text-cell-input");
+              if (allNew[idx + 1]) allNew[idx + 1].focus();
+            }
+          } else if (ke.key === "Enter") {
+            ke.preventDefault();
+            const downIdx = idx + cols;
+            if (downIdx < cellInputs.length) cellInputs[downIdx].focus();
+          } else if (ke.key === "Escape") {
+            inp.blur();
+          }
+        });
+      }
+    }
+
+    const ctrls = tableWrap.createDiv({ cls: "ink-text-table-controls" });
+    const mkTblBtn = (label, title, fn) => {
+      const b = ctrls.createEl("button", { cls: "ink-text-btn", text: label, attr: { title } });
+      b.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+      b.addEventListener("touchstart", (ev) => ev.stopPropagation(), { passive: true });
+      b.addEventListener("click", () => {
+        const oldTbl = cloneTable(tb.table);
+        fn();
+        item.lastCommittedTable = cloneTable(tb.table);
+        this.pushUndo({ t: "texttable", textBlock: tb, oldTable: oldTbl, newTable: cloneTable(tb.table) });
+        this.renderTextTableDom(tb, item);
+        tb.h = Math.max(TEXT_H, Math.round(el.offsetHeight || TEXT_H));
+        this.changed();
+      });
+    };
+
+    mkTblBtn("+ Zeile", "Zeile unten anfügen", () => {
+      tb.table.push(new Array(cols).fill(""));
+    });
+    mkTblBtn("+ Spalte", "Spalte rechts anfügen", () => {
+      for (const row of tb.table) row.push("");
+      tb.w = Math.max(tb.w || TEXT_W, cols * 110 + 90);
+      this.updateTextsTransform();
+    });
+    if (rows > 1) {
+      mkTblBtn("- Zeile", "Letzte Zeile entfernen", () => {
+        tb.table.pop();
+      });
+    }
+    if (cols > 1) {
+      mkTblBtn("- Spalte", "Letzte Spalte entfernen", () => {
+        for (const row of tb.table) row.pop();
+      });
+    }
+  }
+
+  updateTextsTransform() {
+    if (!this.textsLayer) return;
+    const v = this.doc.view;
+    const effTool = this.getEffectiveTool();
+    const isDrawingTool = effTool === "pen" || effTool === "highlighter" || effTool === "eraser";
+    this.textsLayer.classList.toggle("is-drawing-active", isDrawingTool);
+    this.textsLayer.classList.toggle("is-text-mode", effTool === "text");
+
+    for (const tb of (this.doc.texts || [])) {
+      const item = this.textDom.get(tb.id);
+      if (!item) continue;
+      const w = tb.w || TEXT_W;
+      const sx = tb.x * v.z + v.x;
+      const sy = tb.y * v.z + v.y;
+      item.el.style.width = `${w}px`;
+      item.el.style.transform = `translate3d(${sx}px, ${sy}px, 0) scale(${v.z})`;
+      item.el.classList.toggle("is-selected", Boolean(this.sel && this.sel.text === tb));
+      tb.h = Math.max(TEXT_H, Math.round(item.el.offsetHeight || tb.h || TEXT_H));
+    }
+  }
+
+  hitText(d) {
+    const texts = this.doc.texts || [];
+    for (let i = texts.length - 1; i >= 0; i--) {
+      const tb = texts[i];
+      const w = tb.w || TEXT_W;
+      const h = tb.h || TEXT_H;
+      if (d.x >= tb.x && d.x <= tb.x + w && d.y >= tb.y && d.y <= tb.y + h) return tb;
+    }
+    return null;
   }
 
   /* ----- PDF (Ausdruck, Anhang-Karte, Eingebetteter Viewer & Dateiaustausch v2.1.0) ----- */
@@ -746,7 +1460,7 @@ class InkView extends TextFileView {
     const link = { id: uid(), path: file.path, x: Math.round(cx), y: Math.round(cy), w: CARD_W };
     d.links.push(link);
     this.pushUndo({ t: "linkadd", link });
-    this.sel = { entry: null, link, viewer: null, strokes: [] };
+    this.sel = { entry: null, link, viewer: null, text: null, strokes: [] };
     new Notice(`PDF-Anhang verknüpft: ${file.name}`);
     this.changed();
   }
@@ -774,16 +1488,12 @@ class InkView extends TextFileView {
     }
     d.viewers.push(viewer);
     this.pushUndo({ t: "vieweradd", viewer });
-    this.sel = { entry: null, link: null, viewer, strokes: [] };
+    this.sel = { entry: null, link: null, viewer, text: null, strokes: [] };
     this.syncViewerDoms();
     new Notice(`PDF-Viewer eingebettet: ${file.name}`);
     this.changed();
   }
 
-  /**
-   * v2.1.0: Nachträgliches Ändern der PDF-Datei eines bereits eingebetteten PDF-Elements
-   * (unterstützt "entry" = Seiten-Ausdruck, "link" = Anhang-Karte, "viewer" = PDF-Viewer-Fenster).
-   */
   changePdfFile(target, targetType) {
     if (!target || !targetType) return;
     const currentName = target.path ? (target.path.split("/").pop() || target.path) : "PDF";
@@ -886,11 +1596,11 @@ class InkView extends TextFileView {
           .setIcon(item.icon)
           .onClick(() => {
             if (item.type === "entry") {
-              this.sel = { entry: item.obj, link: null, viewer: null, strokes: this.strokesInEntry(item.obj) };
+              this.sel = { entry: item.obj, link: null, viewer: null, text: null, strokes: this.strokesInEntry(item.obj) };
             } else if (item.type === "link") {
-              this.sel = { entry: null, link: item.obj, viewer: null, strokes: [] };
+              this.sel = { entry: null, link: item.obj, viewer: null, text: null, strokes: [] };
             } else if (item.type === "viewer") {
-              this.sel = { entry: null, link: null, viewer: item.obj, strokes: [] };
+              this.sel = { entry: null, link: null, viewer: item.obj, text: null, strokes: [] };
             }
             this.refreshToolbar();
             this.updateViewersTransform();
@@ -944,7 +1654,7 @@ class InkView extends TextFileView {
     };
     this.doc.pdfs.push(entry);
     this.pushUndo({ t: "pdfadd", entry });
-    this.sel = { entry, link: null, viewer: null, strokes: [] };
+    this.sel = { entry, link: null, viewer: null, text: null, strokes: [] };
     new Notice(`Seite ${pageIdx + 1} auf die Leinwand übernommen.`);
     this.changed();
   }
@@ -1027,14 +1737,14 @@ class InkView extends TextFileView {
     nextBtn.addEventListener("click", () => this.scrollViewerToPage(vw, item, (vw.page || 0) + 1));
     extractBtn.addEventListener("click", () => this.insertViewerPageToCanvas(vw));
     changeBtn.addEventListener("click", () => {
-      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.sel = { entry: null, link: null, viewer: vw, text: null, strokes: [] };
       this.refreshToolbar();
       this.updateViewersTransform();
       this.changePdfFile(vw, "viewer");
     });
     openBtn.addEventListener("click", () => this.openPdfLink(vw));
     closeBtn.addEventListener("click", () => {
-      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.sel = { entry: null, link: null, viewer: vw, text: null, strokes: [] };
       this.deleteSelection();
     });
 
@@ -1062,7 +1772,7 @@ class InkView extends TextFileView {
       ev.stopPropagation();
       ev.preventDefault();
       try { header.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
-      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.sel = { entry: null, link: null, viewer: vw, text: null, strokes: [] };
       this.refreshToolbar();
       this.updateViewersTransform();
       const startP = this.local(ev);
@@ -1085,7 +1795,7 @@ class InkView extends TextFileView {
         header.removeEventListener("pointerup", onUp);
         header.removeEventListener("pointercancel", onUp);
         if (Math.abs(totalDx) > 0.5 || Math.abs(totalDy) > 0.5) {
-          this.pushUndo({ t: "move", entry: null, link: null, viewer: vw, strokes: [], dx: totalDx, dy: totalDy });
+          this.pushUndo({ t: "move", entry: null, link: null, viewer: vw, text: null, strokes: [], dx: totalDx, dy: totalDy });
           this.changed();
         }
       };
@@ -1098,7 +1808,7 @@ class InkView extends TextFileView {
       ev.stopPropagation();
       ev.preventDefault();
       try { resizeEl.setPointerCapture(ev.pointerId); } catch (err) { /* */ }
-      this.sel = { entry: null, link: null, viewer: vw, strokes: [] };
+      this.sel = { entry: null, link: null, viewer: vw, text: null, strokes: [] };
       this.refreshToolbar();
       const startDoc = this.toDoc(this.local(ev));
       const w0 = vw.w || VIEWER_W, h0 = vw.h || VIEWER_H;
@@ -1299,6 +2009,10 @@ class InkView extends TextFileView {
       const vw = s.viewer;
       return { x0: vw.x, y0: vw.y, x1: vw.x + (vw.w || VIEWER_W), y1: vw.y + (vw.h || VIEWER_H) };
     }
+    if (s.text) {
+      const tb = s.text;
+      return { x0: tb.x, y0: tb.y, x1: tb.x + (tb.w || TEXT_W), y1: tb.y + (tb.h || TEXT_H) };
+    }
     if (!s.strokes.length) return null;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (const st of s.strokes) {
@@ -1311,7 +2025,7 @@ class InkView extends TextFileView {
 
   hitHandle(p) {
     const b = this.selBounds();
-    if (!b || (this.sel && this.sel.viewer)) return null;
+    if (!b || (this.sel && (this.sel.viewer || this.sel.text))) return null;
     const v = this.doc.view;
     const corners = [
       { hx: b.x1, hy: b.y1, ox: b.x0, oy: b.y0 },
@@ -1353,6 +2067,13 @@ class InkView extends TextFileView {
         this.pushUndo({ t: "viewerdel", viewer: s.viewer, i });
         this.syncViewerDoms();
       }
+    } else if (s.text) {
+      const i = (d.texts || []).indexOf(s.text);
+      if (i >= 0) {
+        d.texts.splice(i, 1);
+        this.pushUndo({ t: "textdel", textBlock: s.text, i });
+        this.syncTextDoms();
+      }
     } else if (s.strokes.length) {
       const set = new Set(s.strokes);
       const items = [];
@@ -1370,14 +2091,37 @@ class InkView extends TextFileView {
 
   duplicateSelection() {
     const s = this.sel;
-    if (!s || s.entry || s.link || s.viewer || !s.strokes.length) return;
+    if (!s) return;
+    if (s.text) {
+      const o = s.text;
+      const copy = {
+        id: uid(),
+        x: Math.round(o.x + 30),
+        y: Math.round(o.y + 30),
+        w: o.w || TEXT_W,
+        h: o.h || TEXT_H,
+        text: o.text || "",
+        color: o.color || "#111111",
+        fontSize: o.fontSize || 18,
+        bgStyle: o.bgStyle || "card",
+        bold: !!o.bold,
+        table: cloneTable(o.table),
+      };
+      this.doc.texts.push(copy);
+      this.pushUndo({ t: "textadd", textBlock: copy });
+      this.sel = { entry: null, link: null, viewer: null, text: copy, strokes: [] };
+      this.syncTextDoms();
+      this.changed();
+      return;
+    }
+    if (s.entry || s.link || s.viewer || !s.strokes.length) return;
     const copies = s.strokes.map((o) => ({
       tool: o.tool, color: o.color, width: o.width, sharp: o.sharp,
       points: o.points.map((p) => [p[0] + 30, p[1] + 30, p[2]]),
     }));
     this.doc.strokes.push(...copies);
     this.pushUndo({ t: "addmany", list: copies });
-    this.sel = { entry: null, link: null, viewer: null, strokes: copies };
+    this.sel = { entry: null, link: null, viewer: null, text: null, strokes: copies };
     this.changed();
   }
 
@@ -1391,6 +2135,17 @@ class InkView extends TextFileView {
       s.viewer.h = clamp(Math.round(h0 * k), 260, 2200);
       this.pushUndo({ t: "viewerresize", viewer: s.viewer, w0, h0, w1: s.viewer.w, h1: s.viewer.h });
       this.updateViewersTransform();
+      this.changed();
+      return;
+    }
+    if (s.text) {
+      const tb = s.text;
+      const oldFs = tb.fontSize || 18;
+      const oldW = tb.w || TEXT_W;
+      tb.fontSize = clamp(Math.round(oldFs * k), 10, 72);
+      tb.w = clamp(Math.round(oldW * k), 120, 1600);
+      this.pushUndo({ t: "textscale", textBlock: tb, oldFs, newFs: tb.fontSize, oldW, newW: tb.w });
+      this.syncTextDoms();
       this.changed();
       return;
     }
@@ -1456,6 +2211,10 @@ class InkView extends TextFileView {
     for (const vw of (this.doc.viewers || [])) {
       x0 = Math.min(x0, vw.x); y0 = Math.min(y0, vw.y);
       x1 = Math.max(x1, vw.x + (vw.w || VIEWER_W)); y1 = Math.max(y1, vw.y + (vw.h || VIEWER_H));
+    }
+    for (const tb of (this.doc.texts || [])) {
+      x0 = Math.min(x0, tb.x); y0 = Math.min(y0, tb.y);
+      x1 = Math.max(x1, tb.x + (tb.w || TEXT_W)); y1 = Math.max(y1, tb.y + (tb.h || TEXT_H));
     }
     for (const s of this.doc.strokes) {
       const b = strokeBounds(s);
@@ -1554,6 +2313,37 @@ class InkView extends TextFileView {
         a.viewer.h = reverse ? a.h0 : a.h1;
         this.updateViewersTransform();
         break;
+      case "textadd":
+        if (reverse) d.texts = (d.texts || []).filter((t) => t !== a.textBlock);
+        else (d.texts || (d.texts = [])).push(a.textBlock);
+        this.syncTextDoms();
+        break;
+      case "textdel":
+        if (reverse) (d.texts || (d.texts = [])).splice(a.i, 0, a.textBlock);
+        else d.texts = (d.texts || []).filter((t) => t !== a.textBlock);
+        this.syncTextDoms();
+        break;
+      case "textedit":
+        a.textBlock.text = reverse ? a.oldText : a.newText;
+        this.syncTextDoms();
+        break;
+      case "textstyle":
+        a.textBlock[a.prop] = reverse ? a.oldVal : a.newVal;
+        this.syncTextDoms();
+        break;
+      case "texttable":
+        a.textBlock.table = cloneTable(reverse ? a.oldTable : a.newTable);
+        this.syncTextDoms();
+        break;
+      case "textresize":
+        a.textBlock.w = reverse ? a.w0 : a.w1;
+        this.syncTextDoms();
+        break;
+      case "textscale":
+        a.textBlock.fontSize = reverse ? a.oldFs : a.newFs;
+        a.textBlock.w = reverse ? a.oldW : a.newW;
+        this.syncTextDoms();
+        break;
       case "pdfchange": {
         const nextPath = reverse ? a.oldPath : a.newPath;
         const nextPage = reverse ? a.oldPage : a.newPage;
@@ -1586,6 +2376,7 @@ class InkView extends TextFileView {
         if (a.entry) { a.entry.x += sg * a.dx; a.entry.y += sg * a.dy; }
         if (a.link) { a.link.x += sg * a.dx; a.link.y += sg * a.dy; }
         if (a.viewer) { a.viewer.x += sg * a.dx; a.viewer.y += sg * a.dy; this.updateViewersTransform(); }
+        if (a.text) { a.text.x += sg * a.dx; a.text.y += sg * a.dy; this.updateTextsTransform(); }
         shiftStrokes(a.strokes, sg * a.dx, sg * a.dy);
         break;
       }
@@ -1605,12 +2396,13 @@ class InkView extends TextFileView {
     this.refreshToolbar();
   }
 
-  /* ----- Clean Tablet UI (v2.1.0) ----- */
+  /* ----- Clean Tablet UI (v2.2.0) ----- */
   buildUI() {
     const root = this.contentEl;
     this.toolbar = root.createDiv({ cls: "ink-toolbar" });
     this.wrap = root.createDiv({ cls: "ink-canvas-wrap" });
     this.canvas = this.wrap.createEl("canvas", { cls: "ink-canvas" });
+    this.textsLayer = this.wrap.createDiv({ cls: "ink-texts-layer" });
     this.viewersLayer = this.wrap.createDiv({ cls: "ink-viewers-layer" });
 
     // Schwebendes Popover für Strichstärke & Glättung
@@ -1645,10 +2437,11 @@ class InkView extends TextFileView {
     this.btnPen = mkBtn(toolsGroup, "pencil", "Stift", () => this.setTool("pen"));
     this.btnHl = mkBtn(toolsGroup, "highlighter", "Textmarker", () => this.setTool("highlighter"));
     this.btnEr = mkBtn(toolsGroup, "eraser", "Radierer", () => this.setTool("eraser"));
+    this.btnText = mkBtn(toolsGroup, "type", "Textblock / Tabelle (auf Leinwand tippen zum Einfügen)", () => this.setTool("text"));
     this.btnLasso = mkBtn(toolsGroup, "lasso-select", "Lasso-Auswahl", () => this.setTool("lasso"));
-    this.btnMove = mkBtn(toolsGroup, "hand", "Bewegen / PDF auswählen", () => this.setTool("move"));
+    this.btnMove = mkBtn(toolsGroup, "hand", "Bewegen / Element auswählen", () => this.setTool("move"));
 
-    // 2. Farben & Strichstärke-Trigger (nur bei Stift/Marker sichtbar)
+    // 2. Farben & Strichstärke-Trigger (sichtbar bei Stift, Marker, Textwerkzeug oder ausgewähltem Textblock)
     this.styleGroup = this.toolbar.createDiv({ cls: "ink-tool-group ink-style-group" });
     this.colorBox = this.styleGroup.createDiv({ cls: "ink-colors" });
     this.btnStrokePopover = this.styleGroup.createEl("button", {
@@ -1661,8 +2454,29 @@ class InkView extends TextFileView {
       this.toggleStrokePopover();
     });
 
-    // 3. Dynamische Kontext-Aktionen (NUR sichtbar, wenn etwas mit Lasso/Hand/Viewer ausgewählt ist!)
+    // 3. Dynamische Kontext-Aktionen (NUR sichtbar, wenn etwas mit Lasso/Hand/Viewer/Text ausgewählt ist!)
     this.contextGroup = this.toolbar.createDiv({ cls: "ink-tool-group ink-context-group is-hidden" });
+    this.btnEditText = mkBtn(this.contextGroup, "edit-3", "Text bearbeiten (Tastatur öffnen)", () => {
+      if (this.sel && this.sel.text) this.focusTextDom(this.sel.text.id, false);
+    });
+    this.btnToggleTable = mkBtn(this.contextGroup, "table", "Tabelle im Textblock ein-/ausblenden", () => {
+      if (this.sel && this.sel.text) {
+        const tb = this.sel.text;
+        const item = this.textDom.get(tb.id);
+        const oldTbl = cloneTable(tb.table);
+        if (!tb.table) {
+          tb.table = [["Spalte 1", "Spalte 2"], ["", ""]];
+          if ((tb.w || TEXT_W) < 320) tb.w = 340;
+        } else {
+          tb.table = null;
+        }
+        if (item) item.lastCommittedTable = cloneTable(tb.table);
+        this.pushUndo({ t: "texttable", textBlock: tb, oldTable: oldTbl, newTable: cloneTable(tb.table) });
+        this.syncTextDoms();
+        this.changed();
+        if (tb.table) setTimeout(() => this.focusTextDom(tb.id, true), 20);
+      }
+    });
     this.btnChangePdf = mkBtn(this.contextGroup, "refresh-cw", "Eingebettete PDF-Datei ändern / austauschen", () => {
       this.changeSelectedPdf();
     });
@@ -1678,13 +2492,32 @@ class InkView extends TextFileView {
     this.btnDel = mkBtn(this.contextGroup, "trash-2", "Auswahl löschen", () => this.deleteSelection());
     this.btnDel.classList.add("is-danger-icon");
 
-    // 4. Undo / Redo & PDF & Mehr-Menü
+    // 4. Undo / Redo & Einfügen-Menü & Mehr-Menü
     const rightGroup = this.toolbar.createDiv({ cls: "ink-tool-group" });
     this.btnUndo = mkBtn(rightGroup, "undo-2", "Rückgängig (2-Finger-Tippen)", () => this.undo());
     this.btnRedo = mkBtn(rightGroup, "redo-2", "Wiederholen (3-Finger-Tippen)", () => this.redo());
 
-    mkBtn(rightGroup, "file-plus", "PDF einfügen oder eingebettete PDF ändern", (ev) => {
+    mkBtn(rightGroup, "file-plus", "Textblock, Tabelle oder PDF einfügen", (ev) => {
       const menu = new Menu();
+      menu.addItem((item) =>
+        item
+          .setTitle("Textblock zum Tippen einfügen")
+          .setIcon("type")
+          .onClick(() => {
+            this.setTool("text");
+            this.addTextBlock(null, null, false);
+          })
+      );
+      menu.addItem((item) =>
+        item
+          .setTitle("Textblock mit Tabelle einfügen")
+          .setIcon("table")
+          .onClick(() => {
+            this.setTool("text");
+            this.addTextBlock(null, null, true);
+          })
+      );
+      menu.addSeparator();
       menu.addItem((item) =>
         item
           .setTitle("PDF als Viewer-Fenster einbetten")
@@ -1803,6 +2636,7 @@ class InkView extends TextFileView {
     this.resize();
     this.refreshToolbar();
     this.syncViewerDoms();
+    this.syncTextDoms();
   }
 
   buildStrokePopover() {
@@ -1810,7 +2644,6 @@ class InkView extends TextFileView {
     const stop = (e) => e.stopPropagation();
     this.strokePopover.addEventListener("pointerdown", stop);
 
-    // Schnellauswahl-Buttons für Strichstärke
     const presetsRow = this.strokePopover.createDiv({ cls: "ink-popover-presets" });
     const presets = [1.5, 2.5, 4, 7, 11];
     for (const pVal of presets) {
@@ -1832,7 +2665,6 @@ class InkView extends TextFileView {
       });
     }
 
-    // Feineinstellung Strichstärke
     const rowW = this.strokePopover.createDiv({ cls: "ink-popover-row" });
     rowW.createSpan({ cls: "ink-popover-label", text: "Stärke" });
     this.widthSliderEl = rowW.createEl("input", {
@@ -1850,7 +2682,6 @@ class InkView extends TextFileView {
       this.updateStrokeTriggerPreview();
     });
 
-    // Glättung
     const rowS = this.strokePopover.createDiv({ cls: "ink-popover-row" });
     rowS.createSpan({ cls: "ink-popover-label", text: "Glättung" });
     const smSlider = rowS.createEl("input", {
@@ -1881,8 +2712,8 @@ class InkView extends TextFileView {
 
   updateStrokeTriggerPreview() {
     if (!this.strokePreviewDot) return;
-    const isPen = this.tool !== "highlighter";
-    const col = isPen ? this.penColor : this.hlColor;
+    const isHl = this.tool === "highlighter";
+    const col = isHl ? this.hlColor : this.penColor;
     const sz = clamp(Math.round(this.width * 1.3 + 4), 5, 20);
     this.strokePreviewDot.style.width = `${sz}px`;
     this.strokePreviewDot.style.height = `${sz}px`;
@@ -1897,7 +2728,13 @@ class InkView extends TextFileView {
   }
 
   setTool(t) {
-    if (t !== this.tool) { this.sel = null; this.lasso = null; }
+    if (t !== this.tool) {
+      if (t !== "text" && t !== "move" && t !== "lasso") {
+        this.blurAllTexts();
+      }
+      this.sel = null;
+      this.lasso = null;
+    }
     this.tool = t;
     this.barrelHeld = false;
     this.contextMenuBarrel = false;
@@ -1905,14 +2742,10 @@ class InkView extends TextFileView {
     if (this.strokePopover) this.strokePopover.classList.remove("is-open");
     this.refreshToolbar();
     this.updateViewersTransform();
+    this.updateTextsTransform();
     this.requestDraw();
   }
 
-  /**
-   * Liefert das aktuell wirksame Werkzeug unter Berücksichtigung der gehaltenen S-Pen-Seitentaste.
-   * Solange `this.barrelHeld` aktiv ist, wird temporär auf `eraser` (bzw. `move`) umgeschaltet,
-   * ohne dass `this.tool` (der vorher benutzte Stift) verloren geht!
-   */
   getEffectiveTool() {
     if (this.barrelHeld && this.plugin.settings.penButton !== "off") {
       return this.plugin.settings.penButton === "eraser" ? "eraser" : "move";
@@ -1946,46 +2779,69 @@ class InkView extends TextFileView {
     if (!this.btnPen) return;
     const effTool = this.getEffectiveTool();
     const isBarrelOverride = this.barrelHeld && this.plugin.settings.penButton !== "off";
-    const act = (b, on) => b.classList.toggle("is-active", !!on);
+    const act = (b, on) => b && b.classList.toggle("is-active", !!on);
     act(this.btnPen, effTool === "pen");
     act(this.btnHl, effTool === "highlighter");
     act(this.btnEr, effTool === "eraser");
+    act(this.btnText, effTool === "text");
     act(this.btnLasso, effTool === "lasso");
     act(this.btnMove, effTool === "move");
     this.btnEr.classList.toggle("is-barrel-override", Boolean(isBarrelOverride && effTool === "eraser"));
     this.btnUndo.disabled = !this.undoStack.length;
     this.btnRedo.disabled = !this.redoStack.length;
 
-    // Dynamische Kontext-Pille nur einblenden, wenn eine Auswahl existiert
     const s = this.sel;
-    const hasSel = Boolean(s && (s.entry || s.link || s.viewer || (s.strokes && s.strokes.length)));
+    const hasSel = Boolean(s && (s.entry || s.link || s.viewer || s.text || (s.strokes && s.strokes.length)));
     this.contextGroup.classList.toggle("is-hidden", !hasSel);
     if (hasSel) {
-      const canDup = Boolean(!s.entry && !s.link && !s.viewer && s.strokes.length);
+      const isTextTarget = Boolean(s.text);
+      const canDup = Boolean(isTextTarget || (!s.entry && !s.link && !s.viewer && s.strokes.length));
       const isPdfTarget = Boolean(s.link || s.entry || s.viewer);
       const lay = s.entry ? this.entryLayout(s.entry) : null;
       const canUngroup = Boolean(s.entry && s.entry.page == null && lay && lay.pages.length > 1);
 
+      this.btnEditText.classList.toggle("is-hidden", !isTextTarget);
+      this.btnToggleTable.classList.toggle("is-hidden", !isTextTarget);
+      if (isTextTarget) {
+        this.btnToggleTable.classList.toggle("is-active", Boolean(s.text.table && s.text.table.length));
+      }
       this.btnChangePdf.classList.toggle("is-hidden", !isPdfTarget);
       this.btnOpenLink.classList.toggle("is-hidden", !isPdfTarget);
       this.btnDup.classList.toggle("is-hidden", !canDup);
       this.btnUngroup.classList.toggle("is-hidden", !canUngroup);
     }
 
-    // Farb-Pille bleibt bei Stift/Textmarker sichtbar (damit die Toolbar beim Drücken der S-Pen-Taste nicht springt)
-    const showColors = this.tool === "pen" || this.tool === "highlighter";
+    const hasSelText = Boolean(s && s.text);
+    const showColors = this.tool === "pen" || this.tool === "highlighter" || this.tool === "text" || hasSelText;
     this.styleGroup.classList.toggle("is-hidden", !showColors);
+    this.btnStrokePopover.classList.toggle("is-hidden", this.tool === "text" && !hasSelText ? true : false);
     this.colorBox.empty();
 
     if (showColors) {
-      const isPen = this.tool === "pen";
+      const isHl = this.tool === "highlighter" && !hasSelText;
+      const isPen = !isHl;
       const defaults = isPen ? DEFAULT_PEN_COLORS : DEFAULT_HL_COLORS;
       const customs = ((isPen ? this.plugin.settings.customPenColors : this.plugin.settings.customHlColors) || [])
         .filter((c) => !defaults.includes(c.toLowerCase()))
         .slice(-MAX_CUSTOM_COLORS);
       const allColors = [...defaults, ...customs];
-      const cur = (isPen ? this.penColor : this.hlColor).toLowerCase();
+      const activeColorSource = hasSelText ? (s.text.color || this.penColor) : (isPen ? this.penColor : this.hlColor);
+      const cur = activeColorSource.toLowerCase();
       let isCurrentCustom = false;
+
+      const applyChosenColor = (c) => {
+        if (isPen) this.penColor = c; else this.hlColor = c;
+        if (this.sel && this.sel.text) {
+          const tb = this.sel.text;
+          const oldCol = tb.color || "#111111";
+          if (oldCol.toLowerCase() !== c.toLowerCase()) {
+            tb.color = c;
+            this.pushUndo({ t: "textstyle", textBlock: tb, prop: "color", oldVal: oldCol, newVal: c });
+            this.syncTextDoms();
+            this.requestSave();
+          }
+        }
+      };
 
       for (const c of allColors) {
         const cLow = c.toLowerCase();
@@ -2005,7 +2861,7 @@ class InkView extends TextFileView {
         if (cLow === cur) sw.classList.add("is-active");
 
         sw.addEventListener("click", () => {
-          if (isPen) this.penColor = c; else this.hlColor = c;
+          applyChosenColor(c);
           this.refreshToolbar();
         });
 
@@ -2039,7 +2895,7 @@ class InkView extends TextFileView {
       });
       colorInp.addEventListener("input", () => {
         const val = colorInp.value.toLowerCase();
-        if (isPen) this.penColor = val; else this.hlColor = val;
+        applyChosenColor(val);
         this.updateStrokeTriggerPreview();
       });
       colorInp.addEventListener("change", () => {
@@ -2047,7 +2903,7 @@ class InkView extends TextFileView {
         const arr = isPen ? this.plugin.settings.customPenColors : this.plugin.settings.customHlColors;
         const defList = isPen ? DEFAULT_PEN_COLORS : DEFAULT_HL_COLORS;
 
-        if (isPen) this.penColor = val; else this.hlColor = val;
+        applyChosenColor(val);
 
         if (!defList.includes(val)) {
           const existingIdx = arr.findIndex((x) => x.toLowerCase() === val);
@@ -2092,6 +2948,17 @@ class InkView extends TextFileView {
   invalidateStatic() {
     this.staticDirty = true;
     this.updateViewersTransform();
+    this.updateTextsTransform();
+    this.requestDraw();
+  }
+
+  /**
+   * Schnelle Strich-Invalidierung (v2.2.0):
+   * Markiert nur den Statik-Canvas als dirty, OHNE teure DOM-Style-Recalculations
+   * (`updateViewersTransform` / `updateTextsTransform`) bei jedem Radier-Frame auszulösen!
+   */
+  invalidateStrokes() {
+    this.staticDirty = true;
     this.requestDraw();
   }
 
@@ -2227,7 +3094,7 @@ class InkView extends TextFileView {
     if (this.cur) paintStroke(ctx, this.cur, this.predicted);
 
     const sb = this.selBounds();
-    if (sb && !(this.sel && this.sel.viewer)) {
+    if (sb && !(this.sel && (this.sel.viewer || this.sel.text))) {
       ctx.save();
       ctx.strokeStyle = "#4c8dff";
       ctx.lineWidth = 2 / v.z;
@@ -2252,7 +3119,7 @@ class InkView extends TextFileView {
     }
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (sb && !(this.sel && this.sel.viewer)) {
+    if (sb && !(this.sel && (this.sel.viewer || this.sel.text))) {
       const pts = this.sel && (this.sel.entry || this.sel.link)
         ? [[sb.x1, sb.y1]]
         : [[sb.x0, sb.y0], [sb.x1, sb.y0], [sb.x0, sb.y1], [sb.x1, sb.y1]];
@@ -2280,17 +3147,18 @@ class InkView extends TextFileView {
     }
   }
 
-  /* ----- Eingabe & S-Pen-Seitentaste (v2.1.1: Halten = Radierer ohne Einfrieren, Loslassen = vorheriger Stift) ----- */
+  /* ----- Eingabe & Ultra-flüssiger S-Pen-Radierer (v2.2.0) ----- */
   bindEvents() {
     const c = this.canvas;
 
-    // 1. Native Android TouchEvent-Behandlung (passive: false!):
+    // 1. Native Android TouchEvent-Behandlung (passive: false):
     // - Erkennt Samsung S-Pen TOOL_TYPE_ERASER (toolType === 4 / "eraser").
-    // - WICHTIG (v2.1.1 Bugfix): Ruft bei aktivem S-Pen / gedrückter Seitentaste `te.preventDefault()` auf,
-    //   damit Android Chromium NICHT seinen internen `StylusTextSelector` / `GestureProvider` startet und
-    //   den Pointer-Stream beim Aufsetzen per `pointercancel` einfriert!
-    // - Falls Android WebView bei gehaltener Seitentaste dennoch keine `pointermove`-Events mehr sendet,
-    //   führt `handleTouch` den Radierer (bzw. das Verschieben) nahtlos über die Touch-Koordinaten weiter!
+    // - Ruft `te.preventDefault()` NUR bei aktivem S-Pen-Barrel-Modus auf, damit Android keinen
+    //   `StylusTextSelector`-Abbruch auslöst.
+    // - WICHTIG (v2.2.0 Performance-Fix): Führt `eraseAtSegment` im Touch-Handler NUR noch als
+    //   Fallback aus, falls Android den regulären `pointermove`-Stream per `pointercancel` abgebrochen hat
+    //   (`this.pointerCancelledBarrel || now - this.lastPointerMoveTime > 28`). Dadurch wird die dreifache
+    //   CPU-Last pro Frame eliminiert!
     const handleTouch = (te) => {
       let foundEraser = false;
       const list = te.touches && te.touches.length ? te.touches : te.changedTouches || [];
@@ -2305,25 +3173,27 @@ class InkView extends TextFileView {
       this.androidTouchEraser = foundEraser;
       this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
       const now = performance.now();
-      const isRecentPen = (now - this.lastPen) < 650;
 
       if (foundEraser) {
         this.lastPen = now;
         this.lastBarrelSignalTime = now;
         this.hoverClearFrames = 0;
+        clearTimeout(this.barrelReleaseTimer);
         const p0 = list.length ? this.local(list[0]) : null;
         this.setBarrelHeld(true, p0);
       }
 
       if (this.barrelHeld || foundEraser || this.contextMenuBarrel) {
         if (te.cancelable) te.preventDefault();
-        if (list.length === 1 && this.plugin.settings.penButton !== "off") {
+        const needsTouchFallback = this.pointerCancelledBarrel || (now - this.lastPointerMoveTime > 28);
+        if (needsTouchFallback && list.length === 1 && this.plugin.settings.penButton !== "off") {
           const t0 = list[0];
           const p = this.local(t0);
           const d = this.toDoc(p);
           this.lastPen = now;
           this.lastBarrelSignalTime = now;
           this.hoverClearFrames = 0;
+          clearTimeout(this.barrelReleaseTimer);
           this.setBarrelHeld(true, p);
 
           if (!this.active) {
@@ -2345,8 +3215,6 @@ class InkView extends TextFileView {
             this.plugin.settings.penButton
           );
         }
-      } else if (isRecentPen && te.cancelable) {
-        te.preventDefault();
       }
     };
     c.addEventListener("touchstart", handleTouch, { passive: false });
@@ -2355,25 +3223,27 @@ class InkView extends TextFileView {
       this.androidTouchEraser = false;
       this.contextMenuBarrel = false;
       this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
+      this.pointerCancelledBarrel = false;
       if (this.active && this.active.viaBarrel) {
         this.finishBarrelAction();
       }
-      if (!this.keyBarrelHeld) {
-        this.setBarrelHeld(false);
+      // v2.2.0 Scrubbing-Fix: Beim kurzen Anheben der Stiftspitze zwischen schnellen Radier-Zügen
+      // `barrelHeld` NICHT sofort hart abschalten, sondern über Hover-Events bzw. kurzes Nachlauf-Fenster prüfen!
+      if (this.barrelHeld && !this.keyBarrelHeld) {
+        this.scheduleBarrelReleaseCheck();
       }
     }, { passive: true });
     c.addEventListener("touchcancel", () => {
       this.androidTouchEraser = false;
       this.contextMenuBarrel = false;
       this.touchContactActive = false;
+      this.pointerCancelledBarrel = false;
       if (this.active && this.active.viaBarrel) {
         this.finishBarrelAction();
       }
     }, { passive: true });
 
     // 2. Contextmenu auf Canvas:
-    // - Auf dem Desktop (Maus-Rechtsklick) auf ein eingebettetes PDF/Anhang-Karte -> Kontextmenü zum PDF-Ändern/Öffnen
-    // - Beim S-Pen (oder direkt nach Pen-Kontakt): S-Pen-Seitentaste feuert auf Samsung OneUI oft contextmenu!
     c.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -2381,13 +3251,12 @@ class InkView extends TextFileView {
       const isPenEvent = e.pointerType === "pen" || (now - this.lastPen < 650);
 
       if (isPenEvent) {
-        // Nur als S-Pen-Seitentaste werten, wenn es beim Aufsetzen (< 350ms), bei bereits gehaltener Taste oder mit Barrel-Bit kam
-        // (nicht nach langem Stillhalten für die Formerkennung!)
         const dtDown = now - this.lastPenDownTime;
-        if (this.barrelHeld || dtDown < 350 || (e.buttons & 2) || (e.buttons & 32) || e.button === 2) {
+        if (this.barrelHeld || dtDown < 420 || (e.buttons & 2) || (e.buttons & 32) || e.button === 2) {
           this.contextMenuBarrel = true;
           this.lastBarrelSignalTime = now;
           this.hoverClearFrames = 0;
+          clearTimeout(this.barrelReleaseTimer);
           const p = this.local(e);
           this.setBarrelHeld(true, p);
           if (this.active && this.active.kind === "draw") {
@@ -2399,9 +3268,42 @@ class InkView extends TextFileView {
         return;
       }
 
-      // Maus-Rechtsklick auf ein PDF-Element auf der Leinwand -> Kontextmenü zum Ändern/Öffnen
+      // Maus-Rechtsklick auf ein Element auf der Leinwand -> Kontextmenü
       const p = this.local(e);
       const d = this.toDoc(p);
+      const hitTb = this.hitText(d);
+      if (hitTb) {
+        this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
+        this.refreshToolbar();
+        this.updateTextsTransform();
+        this.requestDraw();
+        const menu = new Menu();
+        menu.addItem((mi) =>
+          mi.setTitle("Text bearbeiten").setIcon("edit-3").onClick(() => this.focusTextDom(hitTb.id, false))
+        );
+        menu.addItem((mi) =>
+          mi
+            .setTitle(hitTb.table ? "Tabelle entfernen" : "Tabelle hinzufügen")
+            .setIcon("table")
+            .onClick(() => {
+              const oldTbl = cloneTable(hitTb.table);
+              hitTb.table = hitTb.table ? null : [["Spalte 1", "Spalte 2"], ["", ""]];
+              this.pushUndo({ t: "texttable", textBlock: hitTb, oldTable: oldTbl, newTable: cloneTable(hitTb.table) });
+              this.syncTextDoms();
+              this.changed();
+            })
+        );
+        menu.addItem((mi) =>
+          mi.setTitle("Duplizieren").setIcon("copy").onClick(() => this.duplicateSelection())
+        );
+        menu.addSeparator();
+        menu.addItem((mi) =>
+          mi.setTitle("Textblock löschen").setIcon("trash-2").onClick(() => this.deleteSelection())
+        );
+        menu.showAtMouseEvent(e);
+        return;
+      }
+
       const hitLnk = this.hitLink(d);
       const hitP = !hitLnk ? this.hitPdf(d) : null;
       if (hitLnk || hitP) {
@@ -2411,6 +3313,7 @@ class InkView extends TextFileView {
           entry: hitP || null,
           link: hitLnk || null,
           viewer: null,
+          text: null,
           strokes: hitP ? this.strokesInEntry(hitP) : [],
         };
         this.refreshToolbar();
@@ -2445,6 +3348,7 @@ class InkView extends TextFileView {
         this.keyBarrelHeld = true;
         this.lastBarrelSignalTime = performance.now();
         this.hoverClearFrames = 0;
+        clearTimeout(this.barrelReleaseTimer);
         this.setBarrelHeld(true);
         if (this.active && this.active.kind === "draw") {
           this.switchActiveDrawToBarrel();
@@ -2460,29 +3364,39 @@ class InkView extends TextFileView {
     window.addEventListener("keydown", this._keyDownHandler, true);
     window.addEventListener("keyup", this._keyUpHandler, true);
 
-    // 4. Low-Level pointerrawupdate (liefert auf Android-Tablets S-Pen-Bewegungen auch vor/trotz Gesten-Filterung)
+    // 4. Low-Level pointerrawupdate:
+    // - Erkennt den S-Pen-Seitentasten-Zustand sofort mit 0ms Verzögerung.
+    // - Führt Radier-Segmente nur dann direkt aus, wenn `pointermove` durch Androids `pointercancel`
+    //   unterbrochen wurde (`this.pointerCancelledBarrel`), sodass `pointermove` und `pointerrawupdate`
+    //   niemals doppelt pro Frame rechnen!
     c.addEventListener("pointerrawupdate", (e) => {
       const isPen = e.pointerType === "pen" || this.androidTouchEraser;
       if (!isPen) return;
-      this.lastPen = performance.now();
+      const now = performance.now();
+      this.lastPen = now;
       const p = this.local(e);
       const penOverride = this.resolvePenAction(e, p);
       if (penOverride) {
-        const d = this.toDoc(p);
         this.updateDebugHud(e, penOverride);
-        if (!this.active) {
-          this.startBarrelContactAction(e.pointerId, p);
-        } else if (this.active.kind === "draw") {
+        if (this.active && this.active.kind === "draw") {
           this.switchActiveDrawToBarrel(p);
-        } else if (this.active.kind === "erase") {
-          this.eraseAtSegment(this.active.lastDoc || d, d, p);
-          this.active.lastDoc = d;
-        } else if (this.active.kind === "pan" && this.active.viaBarrel) {
-          const v = this.doc.view;
-          v.x += p.x - this.active.last.x;
-          v.y += p.y - this.active.last.y;
-          this.active.last = p;
-          this.invalidateStatic();
+          return;
+        }
+        const needsRawFallback = this.pointerCancelledBarrel || (now - this.lastPointerMoveTime > 28);
+        if (needsRawFallback && ((e.pressure || 0) > 0 || this.touchContactActive)) {
+          const d = this.toDoc(p);
+          if (!this.active) {
+            this.startBarrelContactAction(e.pointerId, p);
+          } else if (this.active.kind === "erase") {
+            this.eraseAtSegment(this.active.lastDoc || d, d, p);
+            this.active.lastDoc = d;
+          } else if (this.active.kind === "pan" && this.active.viaBarrel) {
+            const v = this.doc.view;
+            v.x += p.x - this.active.last.x;
+            v.y += p.y - this.active.last.y;
+            this.active.last = p;
+            this.invalidateStatic();
+          }
         }
       }
     });
@@ -2497,7 +3411,9 @@ class InkView extends TextFileView {
       this.keyBarrelHeld = false;
       this.contextMenuBarrel = false;
       this.touchContactActive = false;
+      this.pointerCancelledBarrel = false;
       this.hoverBtn1Frames = 0;
+      clearTimeout(this.barrelReleaseTimer);
       this.setBarrelHeld(false);
       if (this.eraserPos && !this.active) { this.eraserPos = null; this.requestDraw(); }
     });
@@ -2506,13 +3422,21 @@ class InkView extends TextFileView {
     c.addEventListener("selectstart", (e) => e.preventDefault());
   }
 
-  /**
-   * Aktiviert oder deaktiviert den temporären S-Pen-Seitentasten-Modus (Radierer/Pan).
-   * Beim Aktivieren leuchtet in der Toolbar sofort der Radierer auf; beim Loslassen
-   * wird wieder das vorherige Werkzeug (`this.tool`, z.B. Stift oder Textmarker) aktiviert.
-   */
+  scheduleBarrelReleaseCheck() {
+    clearTimeout(this.barrelReleaseTimer);
+    this.lastBarrelLiftTime = performance.now();
+    this.barrelReleaseTimer = setTimeout(() => {
+      if (!this.touchContactActive && !this.keyBarrelHeld && (!this.active || !this.active.viaBarrel)) {
+        if (performance.now() - this.lastBarrelSignalTime > 160) {
+          this.setBarrelHeld(false);
+        }
+      }
+    }, 220);
+  }
+
   setBarrelHeld(held, p) {
     const next = Boolean(held && this.plugin.settings.penButton !== "off");
+    if (next) clearTimeout(this.barrelReleaseTimer);
     if (this.barrelHeld === next) {
       if (next && p && this.plugin.settings.penButton === "eraser") {
         this.eraserPos = p;
@@ -2524,6 +3448,7 @@ class InkView extends TextFileView {
     if (!next) {
       this.contextMenuBarrel = false;
       this.contactHasBarrelBit = false;
+      this.pointerCancelledBarrel = false;
       this.hoverBtn1Frames = 0;
       if (this.active && this.active.viaBarrel) {
         this.finishBarrelAction();
@@ -2536,6 +3461,7 @@ class InkView extends TextFileView {
       this.eraserPos = p;
       this.requestDraw();
     }
+    this.updateTextsTransform();
     this.refreshToolbar();
   }
 
@@ -2549,42 +3475,63 @@ class InkView extends TextFileView {
     if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
     if (a.kind === "erase" && a.removed && a.removed.length) {
       this.pushUndo({ t: "del", items: a.removed });
-      this.changed();
+      this.requestSave();
+      this.refreshToolbar();
+      this.requestDraw();
     } else {
       this.requestDraw();
     }
   }
 
-  startBarrelContactAction(pointerId, p) {
+  startBarrelContactAction(pointerId, p, replayPts) {
     const st = this.plugin.settings;
     if (st.penButton === "off") return;
     const d = this.toDoc(p);
     if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
     if (st.penButton === "eraser") {
       const prevRemoved = (this.active && this.active.kind === "erase") ? this.active.removed : [];
-      this.active = { id: pointerId, kind: "erase", pen: true, viaBarrel: true, removed: prevRemoved, lastDoc: d };
-      this.eraseAtSegment(d, d, p);
+      this.active = { id: pointerId, kind: "erase", pen: true, viaBarrel: true, removed: prevRemoved, lastDoc: d, lastScreen: p };
+      if (Array.isArray(replayPts) && replayPts.length > 0) {
+        let prev = { x: replayPts[0][0], y: replayPts[0][1] };
+        for (let i = 0; i < replayPts.length; i++) {
+          const cur = { x: replayPts[i][0], y: replayPts[i][1] };
+          this.eraseAtSegment(prev, cur, p);
+          prev = cur;
+        }
+        this.eraseAtSegment(prev, d, p);
+      } else {
+        this.eraseAtSegment(d, d, p);
+      }
     } else if (st.penButton === "pan") {
       this.active = { id: pointerId, kind: "pan", pen: true, viaBarrel: true, last: p };
     }
   }
 
+  /**
+   * v2.2.0: Wenn Android das Seitentasten-Signal (z. B. `contextmenu` oder `buttons: 2`) erst 10-40ms
+   * nach dem Aufsetzen der Stiftspitze nachreicht, verwirft `switchActiveDrawToBarrel` nicht nur den
+   * versehentlich begonnenen Strich, sondern radiert rückwirkend entlang der bereits zurückgelegten
+   * Punkte (`replayPts`), sodass sich der Radierer ab dem ersten Millimeter absolut direkt anfühlt!
+   */
   switchActiveDrawToBarrel(fallbackPos) {
     const st = this.plugin.settings;
     if (st.penButton === "off") return;
     const p = fallbackPos || this.eraserPos || this.holdAnchor || { x: 0, y: 0 };
     const ptrId = this.active ? this.active.id : 1;
+    let replayPts = null;
 
     if (this.active && this.active.kind === "draw") {
       clearTimeout(this.holdTimer);
-      const isTinyStart = (performance.now() - this.active.t0 < 240) ||
-        (this.cur && this.cur.points.length < 18);
+      const isTinyStart = (performance.now() - this.active.t0 < 280) ||
+        (this.cur && this.cur.points.length < 24);
 
       if (!isTinyStart && this.cur && this.cur.points.length > 1) {
         this.doc.strokes.push(this.cur);
         this.pushUndo({ t: "add", s: this.cur });
         this.appendStrokeToStatic(this.cur);
         this.requestSave();
+      } else if (this.cur && this.cur.points.length > 0) {
+        replayPts = this.cur.points.slice();
       }
       this.cur = null;
       this.predicted = [];
@@ -2592,7 +3539,7 @@ class InkView extends TextFileView {
     }
 
     this.setBarrelHeld(true, p);
-    this.startBarrelContactAction(ptrId, p);
+    this.startBarrelContactAction(ptrId, p, replayPts);
   }
 
   local(e) {
@@ -2610,17 +3557,6 @@ class InkView extends TextFileView {
     return 0.5;
   }
 
-  /**
-   * Prüft live bei jedem S-Pen-Event, ob die S-Pen-Seitentaste gedrückt gehalten oder losgelassen wurde (v2.1.1):
-   * - Explizite Barrel-Signale: Bit 2 (`buttons & 2`), Bit 4 (`buttons & 4`), Bit 32 (`buttons & 32`),
-   *   `button === 2`, `button === 5`, `androidTouchEraser` (`toolType === 4`), `keyBarrelHeld`.
-   * - Schweben mit gedrückter Seitentaste auf Galaxy Tab S9 FE: `pointermove`/`pointerrawupdate` mit
-   *   `e.pressure === 0 && e.buttons === 1` (mind. 2 Frames), ohne dass gerade normal gezeichnet wird.
-   * - Während des Display-Kontakts mit aktivem `barrelHeld` bleibt der Modus durchgehend erhalten
-   *   (kein 350ms/500ms-Ablauf-Bug beim Aufsetzen!).
-   * - Sobald die Taste losgelassen wird, wird `this.barrelHeld` sofort wieder auf `false` gesetzt
-   *   und auf den vorher benutzten Stift zurückgeschaltet.
-   */
   updateBarrelState(e, p) {
     const isPen = e.pointerType === "pen" || this.androidTouchEraser;
     if (!isPen) return false;
@@ -2644,14 +3580,14 @@ class InkView extends TextFileView {
       this.keyBarrelHeld
     );
 
-    const isMoveEv = e.type === "pointermove" || e.type === "pointerrawupdate";
     const notNormalDraw = !this.active || this.active.viaBarrel;
-    if (isMoveEv && notNormalDraw && pr === 0 && b === 1 && !explicitBit) {
+    // v2.2.0: Sofortige 1-Frame-Erkennung, wenn im Hover `pr === 0 && b === 1` anliegt!
+    if (notNormalDraw && pr === 0 && b === 1 && !explicitBit) {
       this.hoverBtn1Frames++;
     } else if (pr === 0 && b === 0) {
       this.hoverBtn1Frames = 0;
     }
-    const isHoverButton1 = this.hoverBtn1Frames >= 2;
+    const isHoverButton1 = this.hoverBtn1Frames >= 1;
     const hasSignal = explicitBit || isHoverButton1 || this.contextMenuBarrel;
 
     if (hasSignal) {
@@ -2664,32 +3600,29 @@ class InkView extends TextFileView {
       return true;
     }
 
-    // Kein direktes Signal in diesem Frame:
-    // 1) Stift ist in der Luft ohne gedrückte Taste (pressure === 0 und buttons === 0) -> zurück zum normalen Stift!
+    // Stift schwebt ohne gedrückte Taste in der Luft (pr === 0 und b === 0)
     if (pr === 0 && b === 0 && !this.touchContactActive) {
       this.contextMenuBarrel = false;
       this.hoverBtn1Frames = 0;
       this.hoverClearFrames++;
-      if (this.hoverClearFrames >= 2 || now - this.lastBarrelSignalTime > 80) {
+      if (this.hoverClearFrames >= 2 || now - this.lastBarrelSignalTime > 120) {
         this.setBarrelHeld(false);
       }
       return this.barrelHeld;
     }
 
-    // 2) Stift setzt gerade auf (pointerdown) oder bewegt sich auf dem Display, während barrelHeld bereits aktiv ist:
+    // Stift setzt auf oder bewegt sich auf dem Display, während barrelHeld aktiv ist
     if (this.barrelHeld) {
-      // Falls das Gerät während des Display-Kontakts explizite Barrel-Bits (2/4/32) gesendet hat
-      // und diese jetzt während des Ziehens wegfallen (b === 1), wurde der Knopf während des Kontakts losgelassen!
+      const isMoveEv = e.type === "pointermove" || e.type === "pointerrawupdate";
       if (isMoveEv && this.contactHasBarrelBit && b === 1 && pr > 0) {
         this.hoverClearFrames++;
-        if (this.hoverClearFrames >= 2) {
+        if (this.hoverClearFrames >= 3) {
           this.setBarrelHeld(false);
           return false;
         }
       } else {
         this.hoverClearFrames = 0;
       }
-      // Zeitstempel während des Kontakts frisch halten, damit der Barrel-Modus beim Aufsetzen/Ziehen niemals abläuft!
       this.lastBarrelSignalTime = now;
       this.setBarrelHeld(true, p);
       return true;
@@ -2699,7 +3632,7 @@ class InkView extends TextFileView {
   }
 
   resolvePenAction(e, p) {
-    const mode = this.plugin.settings.penButton; // "eraser" | "pan" | "off"
+    const mode = this.plugin.settings.penButton;
     if (mode === "off") return null;
     if (this.updateBarrelState(e, p)) return mode;
     return null;
@@ -2799,10 +3732,13 @@ class InkView extends TextFileView {
 
     const p = this.local(e);
     const d = this.toDoc(p);
+    this.pointerCancelledBarrel = false;
 
     if (isPen) {
-      this.lastPen = performance.now();
-      this.lastPenDownTime = this.lastPen;
+      const now = performance.now();
+      this.lastPen = now;
+      this.lastPenDownTime = now;
+      this.lastPointerMoveTime = now;
       if (this.active && !this.active.pen) {
         this.cancelActive();
       }
@@ -2813,8 +3749,6 @@ class InkView extends TextFileView {
     const penOverride = isPen ? this.resolvePenAction(e, p) : null;
     if (isPen) this.updateDebugHud(e, penOverride);
 
-    // WICHTIG (v2.1.1): PointerCapture niemals bei aktiver S-Pen-Seitentaste oder im Hover setzen,
-    // da Android Chromium sonst den Hover-Pointer sperrt und beim Aufsetzen der Spitze einfriert!
     if (!isPen || (!penOverride && !this.barrelHeld && (e.pressure || 0) > 0)) {
       try { this.canvas.setPointerCapture(e.pointerId); } catch (err) { /* */ }
     } else {
@@ -2825,11 +3759,11 @@ class InkView extends TextFileView {
       } catch (err) { /* */ }
     }
 
-    // Direkt-Buttons auf PDF-Anhang-Karten (nicht auslösen, wenn gerade radiert wird)
+    // Direkt-Buttons auf PDF-Anhang-Karten
     if (this.getEffectiveTool() !== "eraser") {
       const changeBtnHit = this.hitLinkChangeButton(d);
       if (changeBtnHit) {
-        this.sel = { entry: null, link: changeBtnHit, viewer: null, strokes: [] };
+        this.sel = { entry: null, link: changeBtnHit, viewer: null, text: null, strokes: [] };
         this.refreshToolbar();
         this.requestDraw();
         this.changePdfFile(changeBtnHit, "link");
@@ -2854,6 +3788,20 @@ class InkView extends TextFileView {
         this.multiTap.startPts.set(e.pointerId, p);
       }
 
+      // Im Textblock-Werkzeug erzeugt auch ein kurzes 1-Finger-Tippen auf die Leinwand ein Textfeld!
+      if (count === 1 && this.tool === "text") {
+        const hitTb = this.hitText(d);
+        if (hitTb) {
+          this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
+          this.refreshToolbar();
+          this.updateTextsTransform();
+          this.focusTextDom(hitTb.id, false);
+        } else {
+          this.addTextBlock(d.x, d.y, false);
+        }
+        return;
+      }
+
       if (count >= 2 || !this.plugin.settings.fingerDraws) {
         this.cancelActive();
         this.gest = this.gestureState();
@@ -2861,9 +3809,9 @@ class InkView extends TextFileView {
       }
     }
 
-    // Wenn die S-Pen-Seitentaste gedrückt ist (oder ein Touch-Event während aktivem barrelHeld eintrifft):
-    // Sofort die Barrel-Aktion (Radierer/Pan) starten bzw. fortsetzen – ohne Kontakt-Blockade!
+    // S-Pen-Seitentaste gedrückt -> Sofort Radierer/Pan starten oder fortsetzen
     if (penOverride || (this.barrelHeld && this.plugin.settings.penButton !== "off")) {
+      this.blurAllTexts();
       if (this.active && this.active.kind === "draw") {
         this.switchActiveDrawToBarrel(p);
       } else if (this.active && this.active.viaBarrel) {
@@ -2871,6 +3819,7 @@ class InkView extends TextFileView {
         if (this.active.kind === "erase") {
           this.eraseAtSegment(this.active.lastDoc || d, d, p);
           this.active.lastDoc = d;
+          this.active.lastScreen = p;
         } else if (this.active.kind === "pan") {
           this.active.last = p;
         }
@@ -2890,12 +3839,42 @@ class InkView extends TextFileView {
     }
 
     let tool = this.tool;
+
+    // Textblock-Werkzeug: Klick/Tap auf die Leinwand erzeugt sofort ein neues Textfeld zum Tippen
+    if (tool === "text") {
+      const hitTb = this.hitText(d);
+      if (hitTb) {
+        this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
+        this.refreshToolbar();
+        this.updateTextsTransform();
+        this.focusTextDom(hitTb.id, false);
+      } else {
+        this.addTextBlock(d.x, d.y, false);
+      }
+      return;
+    }
+
+    this.blurAllTexts();
     if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
 
     if (tool === "move" || tool === "lasso") {
       const now = performance.now();
+      const isDoubleTap = (now - this.lastTapTime < 360) &&
+        this.lastTapPos && Math.hypot(p.x - this.lastTapPos.x, p.y - this.lastTapPos.y) < 22;
+
+      const hitTb = this.hitText(d);
+      if (hitTb && isDoubleTap) {
+        this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
+        this.lastTapTime = 0;
+        if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
+        this.refreshToolbar();
+        this.updateTextsTransform();
+        this.focusTextDom(hitTb.id, false);
+        return;
+      }
+
       const hitLnk = this.hitLink(d);
-      if (hitLnk && now - this.lastTapTime < 350 && this.lastTapPos && Math.hypot(p.x - this.lastTapPos.x, p.y - this.lastTapPos.y) < 20) {
+      if (hitLnk && isDoubleTap) {
         this.openPdfLink(hitLnk);
         this.lastTapTime = 0;
         if (this.viewersLayer) this.viewersLayer.classList.remove("is-drawing-active");
@@ -2916,19 +3895,22 @@ class InkView extends TextFileView {
         return;
       }
       if (tool === "move") {
-        if (hitLnk) {
-          this.sel = { entry: null, link: hitLnk, viewer: null, strokes: [] };
-          this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: hitLnk, viewer: null, strokes: [], dx: 0, dy: 0 };
+        if (hitTb) {
+          this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
+          this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: null, viewer: null, text: hitTb, strokes: [], dx: 0, dy: 0 };
+        } else if (hitLnk) {
+          this.sel = { entry: null, link: hitLnk, viewer: null, text: null, strokes: [] };
+          this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: hitLnk, viewer: null, text: null, strokes: [], dx: 0, dy: 0 };
         } else {
           const hit = this.hitPdf(d);
           if (hit) {
-            this.sel = { entry: hit, link: null, viewer: null, strokes: this.strokesInEntry(hit) };
-            this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: hit, link: null, viewer: null, strokes: this.sel.strokes, dx: 0, dy: 0 };
+            this.sel = { entry: hit, link: null, viewer: null, text: null, strokes: this.strokesInEntry(hit) };
+            this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: hit, link: null, viewer: null, text: null, strokes: this.sel.strokes, dx: 0, dy: 0 };
           } else {
             const hitS = this.hitSingleStroke(d);
             if (hitS) {
-              this.sel = { entry: null, link: null, viewer: null, strokes: [hitS] };
-              this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: null, viewer: null, strokes: [hitS], dx: 0, dy: 0 };
+              this.sel = { entry: null, link: null, viewer: null, text: null, strokes: [hitS] };
+              this.active = { id: e.pointerId, kind: "drag", pen: isPen, last: d, entry: null, link: null, viewer: null, text: null, strokes: [hitS], dx: 0, dy: 0 };
             } else {
               this.sel = null;
               this.active = { id: e.pointerId, kind: "pan", pen: isPen, last: p };
@@ -2940,7 +3922,7 @@ class InkView extends TextFileView {
         if (b && d.x >= b.x0 && d.x <= b.x1 && d.y >= b.y0 && d.y <= b.y1) {
           this.active = {
             id: e.pointerId, kind: "drag", pen: isPen, last: d,
-            entry: this.sel.entry, link: this.sel.link, viewer: this.sel.viewer, strokes: this.sel.strokes, dx: 0, dy: 0,
+            entry: this.sel.entry, link: this.sel.link, viewer: this.sel.viewer, text: this.sel.text, strokes: this.sel.strokes, dx: 0, dy: 0,
           };
         } else {
           this.sel = null;
@@ -2950,6 +3932,7 @@ class InkView extends TextFileView {
       }
       this.refreshToolbar();
       this.updateViewersTransform();
+      this.updateTextsTransform();
       this.requestDraw();
       return;
     }
@@ -2962,6 +3945,7 @@ class InkView extends TextFileView {
         viaBarrel: false,
         removed: [],
         lastDoc: d,
+        lastScreen: p,
       };
       this.eraseAtSegment(d, d, p);
       return;
@@ -2986,7 +3970,11 @@ class InkView extends TextFileView {
 
   onMove(e) {
     const isPen = e.pointerType === "pen" || this.androidTouchEraser;
-    if (isPen) this.lastPen = performance.now();
+    const now = performance.now();
+    if (isPen) {
+      this.lastPen = now;
+      this.lastPointerMoveTime = now;
+    }
     const p = this.local(e);
     const d = this.toDoc(p);
 
@@ -2997,19 +3985,15 @@ class InkView extends TextFileView {
       if (isPen) this.updateDebugHud(e, penOverride);
 
       if (penOverride) {
-        // S-Pen-Seitentaste ist gedrückt:
-        // - Falls zuvor ein Zeichenstrich lief -> sofort in Barrel-Radierer/Pan umwandeln!
-        // - Falls noch keine Aktion lief -> sofort Barrel-Radierer/Pan starten!
         if (this.active && this.active.kind === "draw") {
           this.switchActiveDrawToBarrel(p);
           return;
         }
-        if (!this.active) {
+        if (!this.active && ((e.pressure || 0) > 0 || (e.buttons || 0) > 0 || this.touchContactActive)) {
           this.startBarrelContactAction(e.pointerId, p);
           return;
         }
       } else {
-        // Seitentaste ist NICHT (mehr) gedrückt:
         if (this.active && this.active.viaBarrel) {
           this.finishBarrelAction();
         }
@@ -3022,8 +4006,6 @@ class InkView extends TextFileView {
             this.requestDraw();
           }
 
-          // Falls die Seitentaste während des Kontakts auf dem Display losgelassen wurde:
-          // Sofort mit dem vorher benutzten Stift (this.tool) weiterschreiben!
           if ((e.buttons & 1) && (e.pressure || 0) > 0 && (this.tool === "pen" || this.tool === "highlighter")) {
             const pr = this.pressure(e);
             if (this.viewersLayer) this.viewersLayer.classList.add("is-drawing-active");
@@ -3038,7 +4020,7 @@ class InkView extends TextFileView {
             this.rawLast = { x: d.x, y: d.y, p: pr };
             this.snapped = null;
             this.holdAnchor = p;
-            this.active = { id: e.pointerId, kind: "draw", pen: true, t0: performance.now(), startScreen: p };
+            this.active = { id: e.pointerId, kind: "draw", pen: true, t0: now, startScreen: p };
             this.armHold();
             this.requestDraw();
             return;
@@ -3055,7 +4037,7 @@ class InkView extends TextFileView {
       }
       if (this.touches.size >= 2 || !this.plugin.settings.fingerDraws) {
         e.preventDefault();
-        if (!this.multiTap || this.multiTap.moved || performance.now() - this.multiTap.t0 > 180) {
+        if (!this.multiTap || this.multiTap.moved || now - this.multiTap.t0 > 180) {
           this.applyGesture();
         }
         return;
@@ -3129,6 +4111,7 @@ class InkView extends TextFileView {
         const ld = this.toDoc(lp);
         this.eraseAtSegment(a.lastDoc || ld, ld, lp);
         a.lastDoc = ld;
+        a.lastScreen = lp;
       }
     } else if (a.kind === "pan") {
       v.x += p.x - a.last.x;
@@ -3140,6 +4123,7 @@ class InkView extends TextFileView {
       if (a.entry) { a.entry.x += dx; a.entry.y += dy; }
       if (a.link) { a.link.x += dx; a.link.y += dy; }
       if (a.viewer) { a.viewer.x += dx; a.viewer.y += dy; this.updateViewersTransform(); }
+      if (a.text) { a.text.x += dx; a.text.y += dy; this.updateTextsTransform(); }
       shiftStrokes(a.strokes, dx, dy);
       a.dx += dx; a.dy += dy;
       a.last = d;
@@ -3209,10 +4193,11 @@ class InkView extends TextFileView {
       }
     }
 
-    // Falls Android wegen gedrückter S-Pen-Seitentaste (contextmenu / Stylus-Geste) ein künstliches pointercancel feuert:
-    // Den laufenden Barrel-Radierer NICHT abbrechen (auch ohne 500ms-Ablauf-Limit!), damit `touchmove` / `pointerrawupdate` / `pointermove`
-    // nahtlos weiterradieren können!
+    // Falls Android wegen gedrückter S-Pen-Seitentaste ein künstliches pointercancel feuert:
+    // `pointerCancelledBarrel = true` markieren, damit `touchmove`/`pointerrawupdate` den Radierer
+    // ohne jede Unterbrechung weiterführen!
     if (cancelled && (isPen || this.barrelHeld) && (this.barrelHeld || this.contextMenuBarrel)) {
+      this.pointerCancelledBarrel = true;
       if (this.active && this.active.kind === "draw") {
         this.switchActiveDrawToBarrel(this.local(e));
       } else if (!this.active && this.plugin.settings.penButton !== "off") {
@@ -3226,12 +4211,12 @@ class InkView extends TextFileView {
       this.keyBarrelHeld = false;
       this.contextMenuBarrel = false;
       this.touchContactActive = false;
-      this.hoverBtn1Frames = 0;
-      // Wenn beim Abheben/Loslassen keine Barrel-Bits mehr anliegen, sofort zurück zum vorherigen Stift!
-      const b = e.buttons || 0;
-      const stillHeld = Boolean((b & 2) || (b & 4) || (b & 32));
-      if (!stillHeld) {
-        this.setBarrelHeld(false);
+      this.pointerCancelledBarrel = false;
+      // v2.2.0 Scrubbing-Fix: Beim Anheben der Stiftspitze nach einem Radier-Zug NICHT sofort
+      // `setBarrelHeld(false)` erzwingen, sondern über die nachfolgenden Hover-Events (bzw. Timer)
+      // prüfen, ob die Seitentaste noch gedrückt gehalten wird!
+      if (this.barrelHeld) {
+        this.scheduleBarrelReleaseCheck();
       }
       this.updateDebugHud(e, this.barrelHeld ? this.plugin.settings.penButton : null);
     }
@@ -3261,11 +4246,12 @@ class InkView extends TextFileView {
     } else if (a.kind === "erase") {
       if (a.removed.length) {
         this.pushUndo({ t: "del", items: a.removed });
-        this.changed();
+        this.requestSave();
+        this.refreshToolbar();
       }
     } else if (a.kind === "drag") {
       if (a.dx || a.dy) {
-        this.pushUndo({ t: "move", entry: a.entry, link: a.link, viewer: a.viewer, strokes: a.strokes, dx: a.dx, dy: a.dy });
+        this.pushUndo({ t: "move", entry: a.entry, link: a.link, viewer: a.viewer, text: a.text, strokes: a.strokes, dx: a.dx, dy: a.dy });
         this.changed();
       }
     } else if (a.kind === "scale") {
@@ -3284,20 +4270,26 @@ class InkView extends TextFileView {
 
     if (poly.length < 5 && Math.hypot(endScreen.x - startScreen.x, endScreen.y - startScreen.y) < 10) {
       const d = this.toDoc(endScreen);
-      const hitL = this.hitLink(d);
-      if (hitL) {
-        this.sel = { entry: null, link: hitL, viewer: null, strokes: [] };
+      const hitTb = this.hitText(d);
+      if (hitTb) {
+        this.sel = { entry: null, link: null, viewer: null, text: hitTb, strokes: [] };
       } else {
-        const hitS = this.hitSingleStroke(d);
-        if (hitS) {
-          this.sel = { entry: null, link: null, viewer: null, strokes: [hitS] };
+        const hitL = this.hitLink(d);
+        if (hitL) {
+          this.sel = { entry: null, link: hitL, viewer: null, text: null, strokes: [] };
         } else {
-          const hitP = this.hitPdf(d);
-          if (hitP) this.sel = { entry: hitP, link: null, viewer: null, strokes: this.strokesInEntry(hitP) };
+          const hitS = this.hitSingleStroke(d);
+          if (hitS) {
+            this.sel = { entry: null, link: null, viewer: null, text: null, strokes: [hitS] };
+          } else {
+            const hitP = this.hitPdf(d);
+            if (hitP) this.sel = { entry: hitP, link: null, viewer: null, text: null, strokes: this.strokesInEntry(hitP) };
+          }
         }
       }
       this.refreshToolbar();
       this.updateViewersTransform();
+      this.updateTextsTransform();
       return;
     }
 
@@ -3317,15 +4309,22 @@ class InkView extends TextFileView {
         for (const q of s.points) if (pointInPoly(q[0], q[1], poly)) inside++;
         if (inside / s.points.length >= 0.5) picked.push(s);
       }
-      if (picked.length) this.sel = { entry: null, link: null, viewer: null, strokes: picked };
+      if (picked.length) this.sel = { entry: null, link: null, viewer: null, text: null, strokes: picked };
     }
     this.refreshToolbar();
     this.updateViewersTransform();
+    this.updateTextsTransform();
   }
 
+  /**
+   * v2.2.0: Hochgeschwindigkeits-Radierer mit geschwindigkeitsabhängiger Radius-Anpassung
+   * und entkoppeltem `invalidateStrokes()` (kein DOM-Layout-Stall während des Radierens).
+   */
   eraseAtSegment(d0, d1, p) {
     const z = this.doc.view.z;
-    const r = ERASER_R / z;
+    const screenDist = Math.hypot((d1.x - d0.x) * z, (d1.y - d0.y) * z);
+    const speedBoost = clamp(1 + screenDist / 90, 1, 1.35);
+    const r = (ERASER_R * speedBoost) / z;
     const minX = Math.min(d0.x, d1.x) - r, maxX = Math.max(d0.x, d1.x) + r;
     const minY = Math.min(d0.y, d1.y) - r, maxY = Math.max(d0.y, d1.y) + r;
     const strokes = this.doc.strokes;
@@ -3337,12 +4336,14 @@ class InkView extends TextFileView {
       const hitRadius = r + (s.width * widthMult(s)) / 2;
       if (strokeHitSegment(s, d0.x, d0.y, d1.x, d1.y, hitRadius)) {
         strokes.splice(i, 1);
-        this.active.removed.push({ s, i });
+        if (this.active && this.active.removed) {
+          this.active.removed.push({ s, i });
+        }
         hitAny = true;
       }
     }
     this.eraserPos = p;
-    if (hitAny) this.invalidateStatic();
+    if (hitAny) this.invalidateStrokes();
     else this.requestDraw();
   }
 
@@ -3419,6 +4420,9 @@ class InkView extends TextFileView {
     }
     for (const lnk of (this.doc.links || [])) {
       drawPdfLinkCard(ctx, lnk, s);
+    }
+    for (const tb of (this.doc.texts || [])) {
+      drawTextBlockOnCanvas(ctx, tb);
     }
     for (const st of this.doc.strokes) paintStroke(ctx, st);
 
@@ -3534,6 +4538,32 @@ class InkPlugin extends Plugin {
       id: "new-note-from-pdf",
       name: "Neue Handschrift-Notiz aus PDF erstellen",
       callback: () => this.pickPdf((f) => this.createNote(f, "printout")),
+    });
+    this.addCommand({
+      id: "insert-text-block",
+      name: "Textblock zum Tippen in Handschrift-Notiz einfügen",
+      checkCallback: (checking) => {
+        const v = this.getActiveInk();
+        if (!v) return false;
+        if (!checking) {
+          v.setTool("text");
+          v.addTextBlock(null, null, false);
+        }
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "insert-table-block",
+      name: "Textblock mit Tabelle in Handschrift-Notiz einfügen",
+      checkCallback: (checking) => {
+        const v = this.getActiveInk();
+        if (!v) return false;
+        if (!checking) {
+          v.setTool("text");
+          v.addTextBlock(null, null, true);
+        }
+        return true;
+      },
     });
     this.addCommand({
       id: "insert-pdf-viewer",
@@ -3658,5 +4688,5 @@ class InkPlugin extends Plugin {
   async saveSettings() { await this.saveData(this.settings); }
 }
 
-InkPlugin._test = { recognizeShape, rdp, scaleStrokes, pointInPoly, shiftStrokes };
+InkPlugin._test = { recognizeShape, rdp, scaleStrokes, pointInPoly, shiftStrokes, strokeHitSegment, segSegDistSq };
 module.exports = InkPlugin;
