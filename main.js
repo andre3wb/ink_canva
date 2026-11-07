@@ -1,7 +1,7 @@
 "use strict";
 /*
- * Ink Canvas v2.2.0 – Handschrift-Notizen mit S Pen für Obsidian
- * Neu in v2.2.0:
+ * Ink Canvas v2.2.1 – Handschrift-Notizen mit S Pen für Obsidian
+ * Neu in v2.2.1 / v2.2.0:
  * 1. Textblock- & Tabellen-Funktion (Tippen auf der Leinwand):
  *    - Neues Werkzeug „Textblock“ (T-Icon in der Toolbar) zum Einfügen und Bearbeiten von Textfeldern
  *      direkt auf der unendlichen Leinwand (per Tastatur auf Tablet & PC).

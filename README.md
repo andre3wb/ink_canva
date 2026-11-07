@@ -1,6 +1,15 @@
-# Ink Canvas (S Pen) v2.2.0 – Handschrift, Textblöcke & Tabellen in Obsidian
+# Ink Canvas (S Pen) v2.2.1 – Handschrift, Textblöcke & Tabellen in Obsidian
 
-Handschrift-Notizen auf einer **unendlichen Leinwand** wie in OneNote, optimiert für den **Samsung Galaxy S Pen**. Neu in v2.2.0: **Textblöcke & Tabellen zum Tippen** direkt auf der Leinwand sowie ein **ultra-flüssiger S-Pen-Radierer** ohne Ruckler oder Verbindungs-Aussetzer.
+Handschrift-Notizen auf einer **unendlichen Leinwand** wie in OneNote, optimiert für den **Samsung Galaxy S Pen**. Neu in v2.2.1 / v2.2.0: **Textblöcke & Tabellen zum Tippen** direkt auf der Leinwand sowie ein **ultra-flüssiger S-Pen-Radierer** im Hover und beim Display-Kontakt mit sofortiger Rückschaltung auf den Stift beim Loslassen.
+
+## Neu in Version 2.2.1 (Hotfix Release)
+
+- **Sofortige Rückschaltung auf den Stift beim Loslassen der S-Pen-Taste:**
+  - Behebt das Problem aus v2.2.0, bei dem der Modus nach einem Klick auf die S-Pen-Seitentaste im Hover nicht wieder auf den Stift zurücksprang (`hoverBtn1Frames`-Reset bei `pressure === 0 && buttons === 0` sowie 55ms-Fallback-Timer bei ruhig gehaltenem Stift).
+- **Flüssiges Radieren beim Aufsetzen auf das Display (kein Hängen bei Display-Kontakt):**
+  - Verhindert, dass Androids `ACTION_HOVER_EXIT` (`pointerleave` unmittelbar vor `pointerdown`) den Radierer in der Millisekunde des Aufsetzens abschaltet (`barrelContactLatched`).
+  - Isoliert S-Pen-Aktionen vollständig gegen aufliegende Handballen-Touches (`touchstart` / `touchcancel` / `touchend` / `pointerType === "touch"`).
+  - Verhindert Rückwärtssprünge zwischen `pointerrawupdate` und älteren `getCoalescedEvents()` in `pointermove` während des Display-Kontakts.
 
 ## Neu in Version 2.2.0
 
@@ -12,21 +21,11 @@ Handschrift-Notizen auf einer **unendlichen Leinwand** wie in OneNote, optimiert
    - **Formatierung & Stil:**
      - Schriftgröße direkt im Textblock über **`A-`** / **`A+`** oder über die Verkleinern/Vergrößern-Buttons skalierbar.
      - Fettdruck (**`B`**), freie Textfarben-Wahl über die Farbpalette der Toolbar sowie umschaltbarer Hintergrund (**Karte**, **Notizzettel-Gelb** oder **Transparent**).
-     - Nahtloses Zusammenspiel mit dem S Pen: Sobald Stift, Textmarker oder Radierer aktiv sind, kannst du problemlos über oder neben Textblöcke schreiben und markieren; per Doppeltipp im Hand-/Lasso-Modus oder Klick im Text-Modus bearbeitest du den Text weiter.
      - Vollständige Unterstützung für **Rückgängig/Wiederholen (Undo/Redo)**, **Duplizieren** und **PNG-Export**.
 
-2. **Ultra-flüssiger S-Pen-Radierer & Seitentasten-Optimierung:**
-   - **Lückenlose Echtzeit-Kollisionserkennung:** Neue kontinuierliche Segment-zu-Segment-Berechnung in Quadratdistanz (`segSegDistSq`) mit geschwindigkeitsabhängigem Radius-Boost – selbst schnelle Wischbewegungen erfassen jeden Strich sofort und ohne CPU-Ruckler.
-   - **Kein Layout-Lag beim Radieren:** Das Neuzeichnen der Strich-Ebene (`invalidateStrokes`) ist nun vollständig von den DOM-Transformationen der PDF-Viewer und Textblöcke entkoppelt; zudem wurde die dreifache Event-Auswertung (`pointermove` vs. `pointerrawupdate` vs. `touchmove`) bereinigt.
-   - **100 % zuverlässiges Verbinden beim Hin-und-Her-Radieren (Scrubbing):**
-     - Sofortige **1-Frame-Hover-Erkennung** beim Drücken der S-Pen-Seitentaste.
-     - Intelligentes **Scrubbing-Haltefenster**: Wenn die Stiftspitze beim schnellen Hin-und-Her-Radieren kurz angehoben wird, bleibt der Seitentasten-Radierer aktiv, solange die Taste gedrückt gehalten wird.
-     - **Rückwirkendes Pfad-Radieren (`replayPts`)**: Falls Android das Seitentasten-Signal erst wenige Millisekunden nach dem Aufsetzen nachreicht, wird der zurückgelegte Anfangspfad sofort rückwirkend mitradiert.
-
-## Neu in Version 2.1.1 & 2.1.0
-
-- **S-Pen-Seitentaste (Halten = Radierer, Loslassen = vorheriger Stift):** Kein Einfrieren beim Aufsetzen auf das Display.
-- **Nachträglicher PDF-Dateiaustausch (`⇄`):** Bereits eingebettete PDFs (Viewer-Fenster, Seiten-Ausdruck oder Anhang-Karte) jederzeit unter Beibehaltung aller handschriftlichen Notizen austauschen.
+2. **Ultra-flüssiger S-Pen-Radierer:**
+   - Kontinuierliche Segment-zu-Segment-Kollisionserkennung in Quadratdistanz (`segSegDistSq`) mit geschwindigkeitsabhängigem Radius-Boost.
+   - Entkoppeltes Neuzeichnen der Strich-Ebene (`invalidateStrokes`) ohne DOM-Layout-Verzögerungen.
 
 ## Installation
 
