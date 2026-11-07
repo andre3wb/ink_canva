@@ -1,15 +1,15 @@
-# Ink Canvas (S Pen) v2.2.1 – Handschrift, Textblöcke & Tabellen in Obsidian
+# Ink Canvas (S Pen) v2.2.2 – Handschrift, Textblöcke & Tabellen in Obsidian
 
-Handschrift-Notizen auf einer **unendlichen Leinwand** wie in OneNote, optimiert für den **Samsung Galaxy S Pen**. Neu in v2.2.1 / v2.2.0: **Textblöcke & Tabellen zum Tippen** direkt auf der Leinwand sowie ein **ultra-flüssiger S-Pen-Radierer** im Hover und beim Display-Kontakt mit sofortiger Rückschaltung auf den Stift beim Loslassen.
+Handschrift-Notizen auf einer **unendlichen Leinwand** wie in OneNote, optimiert für den **Samsung Galaxy S Pen**. Neu in v2.2.2 / v2.2.0: **Textblöcke & Tabellen zum Tippen** direkt auf der Leinwand sowie ein **ultra-flüssiger S-Pen-Radierer** sowohl im Hover als auch beim Aufsetzen/Ziehen auf dem Display mit sofortiger Rückschaltung auf den Stift beim Loslassen.
 
-## Neu in Version 2.2.1 (Hotfix Release)
+## Neu in Version 2.2.2 (S-Pen Display-Kontakt & Hover Fix)
 
-- **Sofortige Rückschaltung auf den Stift beim Loslassen der S-Pen-Taste:**
-  - Behebt das Problem aus v2.2.0, bei dem der Modus nach einem Klick auf die S-Pen-Seitentaste im Hover nicht wieder auf den Stift zurücksprang (`hoverBtn1Frames`-Reset bei `pressure === 0 && buttons === 0` sowie 55ms-Fallback-Timer bei ruhig gehaltenem Stift).
-- **Flüssiges Radieren beim Aufsetzen auf das Display (kein Hängen bei Display-Kontakt):**
-  - Verhindert, dass Androids `ACTION_HOVER_EXIT` (`pointerleave` unmittelbar vor `pointerdown`) den Radierer in der Millisekunde des Aufsetzens abschaltet (`barrelContactLatched`).
-  - Isoliert S-Pen-Aktionen vollständig gegen aufliegende Handballen-Touches (`touchstart` / `touchcancel` / `touchend` / `pointerType === "touch"`).
-  - Verhindert Rückwärtssprünge zwischen `pointerrawupdate` und älteren `getCoalescedEvents()` in `pointermove` während des Display-Kontakts.
+- **100 % flüssiger S-Pen-Knopf-Radierer beim Aufsetzen UND im Hover:**
+  - **Fix gegen `contactHasBarrelBit`-Abbruch beim Aufsetzen:** Auf Samsung Galaxy Tab sendet Android beim Aufsetzen (`pointerdown`) oft das Barrel-Bit (`buttons & 32` / `buttons & 2`), während beim anschließenden Ziehen auf dem Display (`pointermove` / `pointerrawupdate`) nur noch `buttons === 1` gemeldet wird. Der fehlerhafte Abbruch nach 2 Frames bei `b === 1` während des Display-Kontakts wurde entfernt – der Radierer bleibt während des gesamten Display-Kontakts durchgehend eingerastet (`barrelContactLatched`).
+  - **Fix gegen Doppelzählung bei `ACTION_HOVER_EXIT`:** `hoverClearFrames` wird nicht mehr doppelt durch `pointerrawupdate` + `pointermove` desselben Hardware-Frames hochgezählt, und `lastHoverBarrelTime` wird beim Übergang vom Hover zum Aufsetzen nicht vorzeitig gelöscht.
+  - **Aktive Touch- & Pointer-Weiterführung beim Ziehen auf dem Display:** Sowohl `pointerrawupdate` / `pointermove` als auch `touchstart` / `touchmove` (`handleTouch`) führen den Radierer beim Aufsetzen mit voller 120Hz-Abtastrate weiter; künstliche `touchcancel`-Events von Android Chromium brechen den aktiven Radierer nicht mehr ab.
+- **Zuverlässige Rückschaltung auf den Stift beim Loslassen der S-Pen-Seitentaste:**
+  - Sofortige Rückschaltung im Hover (`pressure === 0 && buttons === 0`) sowie beim Abheben vom Display (`pointerup` / `touchend`).
 
 ## Neu in Version 2.2.0
 

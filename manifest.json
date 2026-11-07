@@ -1,9 +1,9 @@
 {
   "id": "ink-canvas",
   "name": "Ink Canvas (S Pen)",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "minAppVersion": "1.5.0",
-  "description": "Handschrift-Notizen mit S Pen auf einer unendlichen Leinwand – Textblöcke & Tabellen zum Tippen, flüssiger S-Pen-Radierer, PDF-Viewer, PDF-Ausdruck & Anhang-Karten.",
+  "description": "Handschrift-Notizen mit S Pen auf einer unendlichen Leinwand – Textblöcke & Tabellen zum Tippen, flüssiger S-Pen-Radierer (Hover & Aufsetzen), PDF-Viewer, PDF-Ausdruck & Anhang-Karten.",
   "author": "Andreas Blumenschein",
   "isDesktopOnly": false
 }
