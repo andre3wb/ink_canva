@@ -575,14 +575,18 @@ class InkView extends TextFileView {
     this.holdAnchor = null;
     this.eraserPos = null;
 
-    // S-Pen Seitentasten-Zustandsautomat (v2.2.0: Ultra-flüssiger Radierer ohne Aussetzer)
+    // S-Pen Seitentasten-Zustandsautomat (v2.2.0: Ultra-flüssiger Radierer & sofortige Rückschaltung)
     this.lastPen = 0;
     this.lastPenDownTime = 0;
+    this.lastNormalDrawUpTime = 0;
+    this.lastHoverBarrelTime = 0;
+    this.lastRawEraseTime = 0;
     this.lastPointerMoveTime = 0;
+    this.lastPointerCancelTime = 0;
     this.pointerCancelledBarrel = false;
     this.barrelHeld = false;
+    this.barrelContactLatched = false;
     this.lastBarrelSignalTime = 0;
-    this.lastBarrelLiftTime = 0;
     this.barrelReleaseTimer = null;
     this.hoverClearFrames = 0;
     this.hoverBtn1Frames = 0;
@@ -3151,71 +3155,40 @@ class InkView extends TextFileView {
   bindEvents() {
     const c = this.canvas;
 
-    // Hilfsfunktion: Wählt aus einer TouchList den S-Pen-Kontakt aus (ignoriert Handballen / Palm)
-    const pickPenTouch = (te) => {
-      const changed = te.changedTouches || [];
-      const touches = te.touches || [];
-      for (let i = 0; i < touches.length; i++) {
-        const t = touches[i];
-        const tt = t.toolType !== undefined ? t.toolType : "";
-        if (tt === "eraser" || tt === 4 || tt === "stylus" || tt === 2 || t.touchType === "stylus") {
-          return { touch: t, isEraserTool: tt === "eraser" || tt === 4 };
-        }
-      }
-      for (let i = 0; i < changed.length; i++) {
-        const t = changed[i];
-        const tt = t.toolType !== undefined ? t.toolType : "";
-        if (tt === "eraser" || tt === 4 || tt === "stylus" || tt === 2 || t.touchType === "stylus") {
-          return { touch: t, isEraserTool: tt === "eraser" || tt === 4 };
-        }
-      }
-      const refPos = (this.active && this.active.lastScreen) || this.eraserPos;
-      const pool = changed.length ? changed : touches;
-      if (!pool.length) return null;
-      if (!refPos) return { touch: pool[0], isEraserTool: false };
-      let best = null;
-      let bestDist = Infinity;
-      for (let i = 0; i < pool.length; i++) {
-        const lp = this.local(pool[i]);
-        const dist = Math.hypot(lp.x - refPos.x, lp.y - refPos.y);
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = pool[i];
-        }
-      }
-      // Falls bereits eine Position bekannt ist und der Touch extrem weit weg ist (> 220px = Handballen), ignorieren
-      if (touches.length > 1 && bestDist > 220) return null;
-      return best ? { touch: best, isEraserTool: false } : null;
-    };
-
-    // 1. Native Android TouchEvent-Behandlung (passive: false):
-    // - Verhindert auf der gesamten Zeichenfläche native Android-Gesten (`StylusTextSelector`),
-    //   damit der S-Pen beim Aufsetzen auf das Display NIEMALS einfriert.
-    // - Führt den S-Pen-Radierer beim Display-Kontakt nahtlos weiter (auch wenn Android zuvor
-    //   `pointercancel` + `pointerleave` ausgelöst hat oder der Handballen aufliegt).
+    // 1. Native Android TouchEvent-Prüfung:
+    // - Erkennt echten Hardware-Radierer (`toolType === "eraser" || toolType === 4`).
+    // - WICHTIG: Normale Handballen-/Finger-Touches (`touchstart`/`touchmove`/`touchend`/`touchcancel`)
+    //   dürfen NIEMALS den S-Pen-Radierer übernehmen, verschieben oder beim Abheben beenden!
+    //   Nur wenn Android zuvor den Pen-Pointer per `pointercancel` abgebrochen hat (`this.pointerCancelledBarrel`),
+    //   darf ein schmaler Stylus-Touch in unmittelbarer Nähe des Radierers (< 90px) als Fallback weiterführen.
     const handleTouch = (te) => {
-      if (te.cancelable) te.preventDefault();
-      const picked = pickPenTouch(te);
-      const foundEraser = Boolean(picked && picked.isEraserTool);
+      const touches = te.touches || [];
+      const changed = te.changedTouches || [];
+      const list = touches.length ? touches : changed;
+      let foundEraser = false;
+      let eraserTouch = null;
+
+      for (let i = 0; i < list.length; i++) {
+        const t = list[i];
+        const tt = t.toolType !== undefined ? t.toolType : "";
+        if (tt === "eraser" || tt === 4) {
+          foundEraser = true;
+          eraserTouch = t;
+          break;
+        }
+      }
+
       this.androidTouchEraser = foundEraser;
-      this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
+      this.touchContactActive = Boolean(touches.length > 0);
       const now = performance.now();
 
-      if (foundEraser && picked) {
-        this.lastPen = now;
-        this.lastBarrelSignalTime = now;
-        this.hoverClearFrames = 0;
-        clearTimeout(this.barrelReleaseTimer);
-        const p0 = this.local(picked.touch);
-        this.setBarrelHeld(true, p0);
-      }
-
-      if ((this.barrelHeld || foundEraser || this.contextMenuBarrel) && picked && this.plugin.settings.penButton !== "off") {
-        const t0 = picked.touch;
-        const p = this.local(t0);
+      if (foundEraser && eraserTouch && this.plugin.settings.penButton !== "off") {
+        if (te.cancelable) te.preventDefault();
+        const p = this.local(eraserTouch);
         const d = this.toDoc(p);
         this.lastPen = now;
         this.lastBarrelSignalTime = now;
+        this.barrelContactLatched = true;
         this.hoverClearFrames = 0;
         clearTimeout(this.barrelReleaseTimer);
         this.setBarrelHeld(true, p);
@@ -3233,10 +3206,46 @@ class InkView extends TextFileView {
           this.active.last = p;
           this.invalidateStatic();
         }
-        this.updateDebugHud(
-          { pointerType: "pen(touch)", buttons: 2, button: 0, pressure: t0.force || 0.5 },
-          this.plugin.settings.penButton
-        );
+        return;
+      }
+
+      // Fallback NUR falls Android während gedrückter S-Pen-Seitentaste `pointercancel` ausgelöst hat:
+      if (this.pointerCancelledBarrel && this.barrelHeld && this.plugin.settings.penButton !== "off" && touches.length > 0) {
+        const refPos = (this.active && this.active.lastScreen) || this.eraserPos;
+        let best = null;
+        let bestDist = Infinity;
+        for (let i = 0; i < touches.length; i++) {
+          const t = touches[i];
+          const rx = t.radiusX || 0, ry = t.radiusY || 0;
+          if (rx > 18 || ry > 18) continue; // Handballen ignorieren
+          const lp = this.local(t);
+          const dist = refPos ? Math.hypot(lp.x - refPos.x, lp.y - refPos.y) : 0;
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = { t, lp };
+          }
+        }
+        if (best && (!refPos || bestDist < 110)) {
+          if (te.cancelable) te.preventDefault();
+          const p = best.lp;
+          const d = this.toDoc(p);
+          this.lastPen = now;
+          this.lastBarrelSignalTime = now;
+          this.hoverClearFrames = 0;
+          clearTimeout(this.barrelReleaseTimer);
+          this.setBarrelHeld(true, p);
+          if (!this.active) {
+            this.startBarrelContactAction(1, p);
+          } else if (this.active.kind === "erase") {
+            this.eraseAtSegment(this.active.lastDoc || d, d, p);
+          } else if (this.active.kind === "pan" && this.active.viaBarrel) {
+            const v = this.doc.view;
+            v.x += p.x - this.active.last.x;
+            v.y += p.y - this.active.last.y;
+            this.active.last = p;
+            this.invalidateStatic();
+          }
+        }
       }
     };
     c.addEventListener("touchstart", handleTouch, { passive: false });
@@ -3244,24 +3253,35 @@ class InkView extends TextFileView {
     c.addEventListener("touchend", (te) => {
       this.touchContactActive = Boolean(te.touches && te.touches.length > 0);
       if (!this.touchContactActive) {
+        const wasTouchDriven = this.androidTouchEraser || this.pointerCancelledBarrel;
         this.androidTouchEraser = false;
-        this.contextMenuBarrel = false;
         this.pointerCancelledBarrel = false;
-        if (this.active && this.active.viaBarrel) {
-          this.finishBarrelAction();
-        }
-        if (this.barrelHeld && !this.keyBarrelHeld) {
-          this.scheduleBarrelReleaseCheck();
+        if (wasTouchDriven) {
+          this.barrelContactLatched = false;
+          this.contextMenuBarrel = false;
+          if (this.active && this.active.viaBarrel) {
+            this.finishBarrelAction();
+          }
+          if (!this.keyBarrelHeld) {
+            this.setBarrelHeld(false);
+          }
         }
       }
     }, { passive: true });
     c.addEventListener("touchcancel", () => {
+      const wasTouchDriven = this.androidTouchEraser || this.pointerCancelledBarrel;
       this.androidTouchEraser = false;
-      this.contextMenuBarrel = false;
       this.touchContactActive = false;
       this.pointerCancelledBarrel = false;
-      if (this.active && this.active.viaBarrel) {
-        this.finishBarrelAction();
+      if (wasTouchDriven) {
+        this.barrelContactLatched = false;
+        this.contextMenuBarrel = false;
+        if (this.active && this.active.viaBarrel) {
+          this.finishBarrelAction();
+        }
+        if (!this.keyBarrelHeld) {
+          this.setBarrelHeld(false);
+        }
       }
     }, { passive: true });
 
@@ -3274,8 +3294,9 @@ class InkView extends TextFileView {
 
       if (isPenEvent) {
         const dtDown = now - this.lastPenDownTime;
-        if (this.barrelHeld || dtDown < 450 || (e.buttons & 2) || (e.buttons & 32) || e.button === 2) {
+        if (this.barrelHeld || dtDown < 420 || (e.buttons & 2) || (e.buttons & 32) || e.button === 2) {
           this.contextMenuBarrel = true;
+          this.barrelContactLatched = true;
           this.lastBarrelSignalTime = now;
           this.hoverClearFrames = 0;
           clearTimeout(this.barrelReleaseTimer);
@@ -3380,6 +3401,7 @@ class InkView extends TextFileView {
     this._keyUpHandler = (ke) => {
       if (ke.key === "F20" || ke.key === "F21" || ke.code === "Eraser") {
         this.keyBarrelHeld = false;
+        this.barrelContactLatched = false;
         this.setBarrelHeld(false);
       }
     };
@@ -3388,8 +3410,7 @@ class InkView extends TextFileView {
 
     // 4. Low-Level pointerrawupdate:
     // - Erkennt den S-Pen-Seitentasten-Zustand sofort mit 0ms Verzögerung (sowohl im Hover als auch beim Aufsetzen!).
-    // - Treibt den Radierer auch während des Display-Kontakts unmittelbar an; dank Distanz-Deduplizierung
-    //   in `eraseAtSegment` (< 1.2px) entstehen dabei keinerlei doppelte Berechnungen mit `pointermove`.
+    // - Treibt den Radierer mit voller Hardware-Abtastrate (120/240Hz) an.
     c.addEventListener("pointerrawupdate", (e) => {
       const isPen = e.pointerType === "pen" || this.androidTouchEraser;
       if (!isPen) return;
@@ -3404,6 +3425,7 @@ class InkView extends TextFileView {
           return;
         }
         const d = this.toDoc(p);
+        this.lastRawEraseTime = now;
         if (!this.active) {
           this.startBarrelContactAction(e.pointerId, p);
         } else if (this.active.kind === "erase") {
@@ -3423,31 +3445,25 @@ class InkView extends TextFileView {
     c.addEventListener("pointermove", (e) => this.onMove(e));
     c.addEventListener("pointerup", (e) => this.onUp(e, false));
     c.addEventListener("pointercancel", (e) => this.onUp(e, true));
-    c.addEventListener("pointerleave", () => {
+    c.addEventListener("pointerleave", (e) => {
+      if (e && e.pointerType === "touch" && !this.androidTouchEraser) return;
       // WICHTIG (v2.2.0 Display-Kontakt-Fix):
-      // Wenn der S-Pen mit gedrückter Seitentaste das Display berührt, feuert Android Chromium oft
-      // `pointercancel` und unmittelbar danach laut W3C-Spezifikation zwangsweise `pointerout` + `pointerleave`
-      // (oder beim Übergang von Hover zu Display-Kontakt `ACTION_HOVER_EXIT` -> `pointerleave`).
-      // Wenn wir in diesem Moment `setBarrelHeld(false)` aufrufen, stirbt der Radierer exakt beim Berühren
-      // des Displays ab! Deshalb ignorieren wir `pointerleave`, solange der Kontakt aktiv ist oder
-      // gerade erst `pointercancel` / `pointerdown` stattfand!
-      const now = performance.now();
-      if (
-        this.touchContactActive ||
-        this.pointerCancelledBarrel ||
-        this.contextMenuBarrel ||
-        this.androidTouchEraser ||
-        (this.lastPointerCancelTime && now - this.lastPointerCancelTime < 800) ||
-        (this.lastPenDownTime && now - this.lastPenDownTime < 650)
-      ) {
+      // Beim Übergang von Hover zu Display-Kontakt feuert Android VOR `pointerdown` immer `ACTION_HOVER_EXIT`
+      // (`pointerleave`). Wenn wir hier sofort synchron `setBarrelHeld(false)` aufrufen, stirbt der Radierer
+      // exakt in der Millisekunde, in der die S-Pen-Spitze das Display berührt!
+      // Daher verzögern wir das Zurücksetzen bei aktivem `barrelHeld` um 160ms; trifft in dieser Zeit
+      // `pointerdown` / `pointermove` auf dem Display ein, läuft der Radierer zu 100 % unterbrechungsfrei weiter!
+      if (this.barrelHeld || this.barrelContactLatched || this.pointerCancelledBarrel || this.contextMenuBarrel) {
+        this.scheduleBarrelReleaseCheck(160);
         return;
       }
       this.androidTouchEraser = false;
       this.keyBarrelHeld = false;
       this.contextMenuBarrel = false;
-      this.touchContactActive = false;
+      this.barrelContactLatched = false;
       this.pointerCancelledBarrel = false;
       this.hoverBtn1Frames = 0;
+      this.lastHoverBarrelTime = 0;
       clearTimeout(this.barrelReleaseTimer);
       this.setBarrelHeld(false);
       if (this.eraserPos && !this.active) { this.eraserPos = null; this.requestDraw(); }
@@ -3457,16 +3473,18 @@ class InkView extends TextFileView {
     c.addEventListener("selectstart", (e) => e.preventDefault());
   }
 
-  scheduleBarrelReleaseCheck() {
+  scheduleBarrelReleaseCheck(delayMs = 60) {
     clearTimeout(this.barrelReleaseTimer);
-    this.lastBarrelLiftTime = performance.now();
     this.barrelReleaseTimer = setTimeout(() => {
-      if (!this.touchContactActive && !this.keyBarrelHeld && (!this.active || !this.active.viaBarrel)) {
-        if (performance.now() - this.lastBarrelSignalTime > 180) {
-          this.setBarrelHeld(false);
-        }
+      this.barrelReleaseTimer = null;
+      if (!this.keyBarrelHeld && !this.barrelContactLatched) {
+        this.contextMenuBarrel = false;
+        this.pointerCancelledBarrel = false;
+        this.hoverBtn1Frames = 0;
+        this.lastHoverBarrelTime = 0;
+        this.setBarrelHeld(false);
       }
-    }, 240);
+    }, delayMs);
   }
 
   setBarrelHeld(held, p) {
@@ -3483,8 +3501,10 @@ class InkView extends TextFileView {
     if (!next) {
       this.contextMenuBarrel = false;
       this.contactHasBarrelBit = false;
+      this.barrelContactLatched = false;
       this.pointerCancelledBarrel = false;
       this.hoverBtn1Frames = 0;
+      this.lastHoverBarrelTime = 0;
       if (this.active && this.active.viaBarrel) {
         this.finishBarrelAction();
       }
@@ -3609,42 +3629,78 @@ class InkView extends TextFileView {
       this.keyBarrelHeld
     );
 
-    const notNormalDraw = !this.active || this.active.viaBarrel;
-    if (notNormalDraw && pr === 0 && b === 1 && !explicitBit) {
+    const isMoveEv = e.type === "pointermove" || e.type === "pointerrawupdate";
+    const notNormalDraw = (!this.active || this.active.viaBarrel) && (now - this.lastNormalDrawUpTime > 80);
+
+    // Im Hover (pr === 0) meldet Samsung Galaxy Tab S Pen die gedrückte Seitentaste als b === 1.
+    // WICHTIG: Sobald die Taste im Hover losgelassen wird (pr === 0 && b === 0), MUSS hoverBtn1Frames
+    // sofort auf 0 zurückgesetzt werden, damit direkt wieder auf den Stift zurückgeschaltet wird!
+    if (isMoveEv && notNormalDraw && pr === 0 && b === 1 && !explicitBit) {
       this.hoverBtn1Frames++;
+    } else if (pr === 0 && b === 0) {
+      this.hoverBtn1Frames = 0;
     }
-    const isHoverButton1 = this.hoverBtn1Frames >= 1;
+
+    const isHoverButton1 = pr === 0 && b === 1 && this.hoverBtn1Frames >= 1;
     const hasSignal = explicitBit || isHoverButton1 || this.contextMenuBarrel;
 
-    // 1) Solange der S-Pen das Display berührt (pr > 0 oder Touch-Kontakt aktiv) und barrelHeld bereits
-    //    aktiv ist (z. B. aus dem Hover übernommen), bleibt der Radierer zu 100 % unterbrechungsfrei aktiv!
-    //    (Verhindert das Abschalten beim Übergang von Hover -> Display-Kontakt!)
-    if (this.barrelHeld && (pr > 0 || b > 0 || this.touchContactActive)) {
-      this.lastBarrelSignalTime = now;
-      this.hoverClearFrames = 0;
-      this.setBarrelHeld(true, p);
-      return true;
-    }
-
     if (hasSignal) {
+      clearTimeout(this.barrelReleaseTimer);
       this.lastBarrelSignalTime = now;
       this.hoverClearFrames = 0;
+      if (pr === 0) {
+        this.lastHoverBarrelTime = now;
+      } else {
+        this.barrelContactLatched = true;
+        if ((b & 2) || (b & 4) || (b & 32)) {
+          this.contactHasBarrelBit = true;
+        }
+      }
       this.setBarrelHeld(true, p);
       return true;
     }
 
-    // 2) Stift schwebt ohne gedrückte Taste in der Luft (pr === 0 und b === 0):
-    //    Erst nach mehreren klaren Hover-Frames UND außerhalb des Aufsetz-Übergangsfensters (`ACTION_HOVER_EXIT`)
-    //    zurück zum normalen Stift wechseln!
-    if (pr === 0 && b === 0 && !this.touchContactActive) {
-      if (now - this.lastPenDownTime < 260) {
-        return this.barrelHeld;
+    // 1) S-Pen berührt das Display (pr > 0):
+    //    Wenn der Radierer aus dem Hover aktiv war (barrelHeld oder lastHoverBarrelTime < 220ms)
+    //    oder bereits für diesen Display-Kontakt eingerastet ist (barrelContactLatched), bleibt
+    //    der Radierer während des gesamten Display-Kontakts zu 100 % stabil und flüssig aktiv!
+    if (pr > 0 && (this.barrelHeld || this.barrelContactLatched || (now - this.lastHoverBarrelTime < 220 && notNormalDraw))) {
+      if (isMoveEv && this.contactHasBarrelBit && b === 1) {
+        this.hoverClearFrames++;
+        if (this.hoverClearFrames >= 2) {
+          this.barrelContactLatched = false;
+          this.lastHoverBarrelTime = 0;
+          this.setBarrelHeld(false);
+          return false;
+        }
+      } else {
+        this.hoverClearFrames = 0;
       }
+      clearTimeout(this.barrelReleaseTimer);
+      this.barrelContactLatched = true;
+      this.lastBarrelSignalTime = now;
+      this.setBarrelHeld(true, p);
+      return true;
+    }
+
+    // 2) S-Pen schwebt ohne gedrückte Taste in der Luft (pr === 0 und b === 0):
+    //    Sofort zurück zum normalen Stift schalten!
+    //    - Beim 2. klaren Hover-Frame (~8ms) wird sofort synchron zurückgeschaltet.
+    //    - Schon beim 1. Frame startet ein kurzer 55ms-Timer, sodass ein einzelner synthetischer
+    //      `ACTION_HOVER_EXIT`-Frame unmittelbar vor `pointerdown` den Radierer beim Aufsetzen NICHT abbricht,
+    //      aber beim echten Loslassen der Taste in der Luft (selbst bei völlig ruhig gehaltenem Stift!)
+    //      garantiert nach spätestens 55ms auf den Stift zurückgeschaltet wird!
+    if (pr === 0 && b === 0) {
+      this.barrelContactLatched = false;
+      this.contextMenuBarrel = false;
+      this.hoverBtn1Frames = 0;
       this.hoverClearFrames++;
-      if (this.hoverClearFrames >= 5 && now - this.lastBarrelSignalTime > 140) {
-        this.contextMenuBarrel = false;
-        this.hoverBtn1Frames = 0;
+      if (this.hoverClearFrames >= 2) {
+        clearTimeout(this.barrelReleaseTimer);
+        this.lastHoverBarrelTime = 0;
         this.setBarrelHeld(false);
+      } else if (this.barrelHeld) {
+        this.scheduleBarrelReleaseCheck(55);
       }
       return this.barrelHeld;
     }
@@ -3755,11 +3811,10 @@ class InkView extends TextFileView {
     const d = this.toDoc(p);
     this.pointerCancelledBarrel = false;
 
-    // Handballen-Schutz (Palm Rejection), falls die S-Pen-Seitentaste aktiv ist und die Hand aufliegt
-    if (e.pointerType === "touch" && !this.androidTouchEraser && this.barrelHeld) {
-      const isPalmSize = (e.width && e.width > 22) || (e.height && e.height > 22);
-      const isFarFromPen = this.eraserPos && Math.hypot(p.x - this.eraserPos.x, p.y - this.eraserPos.y) > 200;
-      if (isPalmSize || isFarFromPen) return;
+    // Handballen-/Touch-Schutz: Während der S-Pen aktiv ist oder die S-Pen-Seitentaste gehalten wird,
+    // dürfen Finger-/Handballen-Touches (`pointerType === "touch"`) NIEMALS dazwischenfunken!
+    if (e.pointerType === "touch" && !this.androidTouchEraser) {
+      if (this.penBusy() || this.barrelHeld || this.barrelContactLatched) return;
     }
 
     if (isPen) {
@@ -3767,6 +3822,7 @@ class InkView extends TextFileView {
       this.lastPen = now;
       this.lastPenDownTime = now;
       this.lastPointerMoveTime = now;
+      clearTimeout(this.barrelReleaseTimer);
       if (this.active && !this.active.pen) {
         this.cancelActive();
       }
@@ -3804,8 +3860,7 @@ class InkView extends TextFileView {
       }
     }
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld) {
-      if (this.penBusy()) return;
+    if (e.pointerType === "touch" && !this.androidTouchEraser) {
       this.touches.set(e.pointerId, p);
       const count = this.touches.size;
 
@@ -3838,8 +3893,9 @@ class InkView extends TextFileView {
     }
 
     // S-Pen-Seitentaste gedrückt -> Sofort Radierer/Pan starten oder aus dem Hover nahtlos auf dem Display fortsetzen!
-    if (penOverride || (this.barrelHeld && this.plugin.settings.penButton !== "off")) {
+    if (isPen && (penOverride || (this.barrelHeld && this.plugin.settings.penButton !== "off"))) {
       this.blurAllTexts();
+      this.barrelContactLatched = true;
       if (this.active && this.active.kind === "draw") {
         this.switchActiveDrawToBarrel(p);
       } else if (this.active && this.active.viaBarrel) {
@@ -4000,22 +4056,15 @@ class InkView extends TextFileView {
     const p = this.local(e);
     const d = this.toDoc(p);
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser && this.barrelHeld) {
-      const isPalmSize = (e.width && e.width > 22) || (e.height && e.height > 22);
-      const isFarFromPen = this.eraserPos && Math.hypot(p.x - this.eraserPos.x, p.y - this.eraserPos.y) > 200;
-      if (isPalmSize || isFarFromPen) return;
+    if (e.pointerType === "touch" && !this.androidTouchEraser) {
+      if (this.penBusy() || this.barrelHeld || this.barrelContactLatched) return;
     }
 
     if (isPen) {
       this.lastPen = now;
       this.lastPointerMoveTime = now;
-    }
-
-    if (isPen || (this.barrelHeld && this.plugin.settings.penButton !== "off")) {
-      const penOverride = isPen
-        ? this.resolvePenAction(e, p)
-        : (this.barrelHeld ? this.plugin.settings.penButton : null);
-      if (isPen) this.updateDebugHud(e, penOverride);
+      const penOverride = this.resolvePenAction(e, p);
+      this.updateDebugHud(e, penOverride);
 
       if (penOverride) {
         if (this.active && this.active.kind === "draw") {
@@ -4062,7 +4111,7 @@ class InkView extends TextFileView {
       }
     }
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld && this.touches.has(e.pointerId)) {
+    if (e.pointerType === "touch" && !this.androidTouchEraser && this.touches.has(e.pointerId)) {
       this.touches.set(e.pointerId, p);
       if (this.multiTap && !this.multiTap.moved) {
         const s0 = this.multiTap.startPts.get(e.pointerId);
@@ -4079,6 +4128,7 @@ class InkView extends TextFileView {
 
     const a = this.active;
     if (!a) return;
+    if (a.pen && !isPen) return;
     if (a.id !== e.pointerId && !a.viaBarrel) return;
     e.preventDefault();
     const v = this.doc.view;
@@ -4137,12 +4187,18 @@ class InkView extends TextFileView {
       }
       this.requestDraw();
     } else if (a.kind === "erase") {
-      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
-      const list = evs.length ? evs : [e];
-      for (const ev of list) {
-        const lp = this.local(ev);
-        const ld = this.toDoc(lp);
-        this.eraseAtSegment(a.lastDoc || ld, ld, lp);
+      // Falls `pointerrawupdate` die Rohpunkte dieses Frames bereits in Echtzeit abgearbeitet hat,
+      // NICHT rückwärts über ältere `getCoalescedEvents()` iterieren (verhindert Rücksprünge beim Display-Kontakt!).
+      if (now - (this.lastRawEraseTime || 0) < 24) {
+        this.eraseAtSegment(a.lastDoc || d, d, p);
+      } else {
+        const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+        const list = evs.length ? evs : [e];
+        for (const ev of list) {
+          const lp = this.local(ev);
+          const ld = this.toDoc(lp);
+          this.eraseAtSegment(a.lastDoc || ld, ld, lp);
+        }
       }
     } else if (a.kind === "pan") {
       v.x += p.x - a.last.x;
@@ -4204,7 +4260,7 @@ class InkView extends TextFileView {
       this.lastPen = now;
     }
 
-    if (e.pointerType === "touch" && !this.androidTouchEraser && !this.barrelHeld) {
+    if (e.pointerType === "touch" && !this.androidTouchEraser) {
       this.touches.delete(e.pointerId);
       this.gest = this.gestureState();
 
@@ -4223,15 +4279,17 @@ class InkView extends TextFileView {
         }
         this.multiTap = null;
       }
+      if (this.active && this.active.pen) return;
     }
 
     // Falls Android beim Aufsetzen des S-Pen mit gedrückter Seitentaste `pointercancel` feuert:
     // `lastPointerCancelTime` & `pointerCancelledBarrel` speichern (damit das unmittelbar folgende
     // zwangsweise `pointerleave` den Radierer NICHT abbricht!) und den Radierer nahtlos weiterlaufen lassen!
-    if (cancelled && (isPen || this.barrelHeld || this.contextMenuBarrel)) {
+    if (cancelled && isPen) {
       this.lastPointerCancelTime = now;
-      this.pointerCancelledBarrel = true;
-      if (this.barrelHeld || this.contextMenuBarrel) {
+      if (this.barrelHeld || this.barrelContactLatched || this.contextMenuBarrel) {
+        this.pointerCancelledBarrel = true;
+        this.scheduleBarrelReleaseCheck(220);
         if (this.active && this.active.kind === "draw") {
           this.switchActiveDrawToBarrel(this.local(e));
         } else if (!this.active && this.plugin.settings.penButton !== "off") {
@@ -4242,19 +4300,29 @@ class InkView extends TextFileView {
     }
 
     if (isPen && !cancelled) {
+      clearTimeout(this.barrelReleaseTimer);
       this.androidTouchEraser = false;
       this.keyBarrelHeld = false;
       this.contextMenuBarrel = false;
-      this.touchContactActive = false;
+      this.barrelContactLatched = false;
+      this.contactHasBarrelBit = false;
       this.pointerCancelledBarrel = false;
-      if (this.barrelHeld) {
-        this.scheduleBarrelReleaseCheck();
+      this.hoverBtn1Frames = 0;
+      this.lastHoverBarrelTime = 0;
+      if (this.active && this.active.kind === "draw") {
+        this.lastNormalDrawUpTime = now;
+      }
+      const stillHeld = Boolean((e.buttons || 0) & (2 | 4 | 32));
+      if (!stillHeld) {
+        this.setBarrelHeld(false);
       }
       this.updateDebugHud(e, this.barrelHeld ? this.plugin.settings.penButton : null);
     }
 
     const a = this.active;
-    if (!a || (a.id !== e.pointerId && !a.viaBarrel)) return;
+    if (!a) return;
+    if (a.pen && !isPen) return;
+    if (a.id !== e.pointerId && !a.viaBarrel) return;
     clearTimeout(this.holdTimer);
     this.active = null;
     if (!this.barrelHeld && this.tool !== "eraser") {
